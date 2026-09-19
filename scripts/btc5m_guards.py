@@ -254,3 +254,58 @@ def position_in_tokens(positions, token_ids) -> dict | None:
         if size > 1e-9:
             return p
     return None
+
+
+# ---------------------------------------------------------------------------
+# Momentum + skew direction filter (items #1, #2, #3)
+# ---------------------------------------------------------------------------
+#
+# The documented strategy is momentum-following: BTC must have moved by at
+# least ``btc_move_usd_min`` (default $70) in the active interval, the side
+# follows the move direction, and entry is vetoed when market skew strongly
+# opposes that direction. These pure functions are shared by the runner and
+# the backtest harness so both apply identical logic.
+
+def momentum_direction(btc_then, btc_now, min_move_usd: float):
+    """Return ``(side, move_usd)`` where side is 'UP' / 'DOWN' / None.
+
+    ``btc_then`` is the BTC price at the interval open, ``btc_now`` the
+    current price. Entries require ``abs(move) >= min_move_usd`` (#1);
+    otherwise side is None (no momentum, no trade).
+    """
+    try:
+        move = float(btc_now) - float(btc_then)
+    except (TypeError, ValueError):
+        return None, 0.0
+    try:
+        min_move = float(min_move_usd)
+    except (TypeError, ValueError):
+        return None, move
+    if abs(move) < min_move:
+        return None, move
+    return ("UP" if move > 0 else "DOWN"), move
+
+
+def skew_veto(side: str, up_ask, dn_ask, veto_threshold: float) -> bool:
+    """True when market skew strongly opposes ``side`` (#2).
+
+    Skew is measured as ``side_ask - other_ask``: positive means the crowd
+    prices our direction as more likely. A veto fires only when skew is
+    negative beyond ``veto_threshold`` — weak/no skew never blocks, per the
+    documented 'do not fade strong momentum by default' rule. Unknown
+    prices fail open (no veto).
+    """
+    try:
+        if side == "UP":
+            skew = float(up_ask) - float(dn_ask)
+        elif side == "DOWN":
+            skew = float(dn_ask) - float(up_ask)
+        else:
+            return False
+    except (TypeError, ValueError):
+        return False
+    try:
+        veto = float(veto_threshold)
+    except (TypeError, ValueError):
+        return False
+    return skew < -abs(veto)

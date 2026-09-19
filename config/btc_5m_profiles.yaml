@@ -39,8 +39,10 @@ profiles:
     description: "More stable mode: stricter filters and lower per-trade risk."
     signal:
       trigger_source: "clob_best_ask"
-      direction_rule: "follow_stronger_side_over_threshold"
+      direction_rule: "btc_momentum_since_market_open"
       threshold_price: 0.70
+      btc_move_usd_min: 70
+      skew_veto_threshold: 0.10
     sizing:
       stake_mode: "fixed_or_cap"
       stake_usd: 5
@@ -63,8 +65,10 @@ profiles:
     description: "Higher frequency and higher risk mode."
     signal:
       trigger_source: "clob_best_ask"
-      direction_rule: "follow_stronger_side_over_threshold"
+      direction_rule: "btc_momentum_since_market_open"
       threshold_price: 0.70
+      btc_move_usd_min: 50
+      skew_veto_threshold: 0.15
     sizing:
       stake_mode: "fixed_or_cap"
       stake_usd: 5
@@ -104,6 +108,10 @@ runner_mapping:
     - "--hedge-max-notional-usd"
     - "--force-close-discount-pct"
     - "--force-close-max-discount-abs"
+    - "--btc-move-usd-min"
+    - "--skew-veto-threshold"
+    - "--disable-momentum"
+  momentum_semantics: "Entry follows the BTC move since market open (Binance 1m klines, cached 30s): side = move direction once |move| clears btc_move_usd_min (70 conservative, 50 aggressive); --threshold stays as a minimum-price floor on the picked side; skew_veto blocks entries against strong crowd flow (0.10 conservative, 0.15 aggressive). --disable-momentum restores the legacy highest-ask trigger."
   sizing_semantics: "--stake-usd is an explicit override only. When unset, the runner derives the stake as equity_usd * risk_per_trade_pct / 100 capped at max_notional_usd (8%/8 conservative, 15%/15 aggressive), floored at $1."
   hedge_semantics: "The micro-hedge is live: when the held-side CLOB bid reaches hedge_trigger_price with at most hedge_trigger_seconds_left remaining, the runner buys hedge_share_of_main_pct of the main cost (clamped to hedge min/max notional) on the opposite side, once per run, and closes it through the same cascade with combined PnL. --disable-hedge turns it off."
   shutdown_semantics: "The runner traps SIGTERM/SIGINT and exits through the close cascade (close_reason 'shutdown'); btc5m_ctl.sh stop waits up to ~30s before SIGKILL."

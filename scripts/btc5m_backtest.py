@@ -6,12 +6,21 @@ Two subcommands:
   fetch    Export CLOB ``book`` snapshots for one market from the Pendulum
            Flow archive (no auth, DuckDB httpfs partial reads) into a local
            JSONL snapshot file. Requires the ``duckdb`` package.
+  fetch-btc
+           Export 1-minute BTC closes (Binance klines, stdlib-only) for a
+           time range into a JSON series file, for momentum validation (#1).
   replay   Replay the entry/exit rules against a snapshot file. Stdlib-only.
 
 The replay mirrors the live runner (scripts/test_btc_5m_session_exit_sl.py):
 entry = highest best-ask >= threshold subject to spread / liquidity /
 staleness gates; fill at the best ask; stop-loss monitored on the best bid;
 time exit ``exit_before_sec`` before market end, filled at the best bid.
+
+With ``--btc-series`` + ``--btc-move-usd-min`` replay instead applies the
+documented momentum strategy (#1, #2, #3): the entry side follows the BTC
+move since market open (the move must clear the minimum), the threshold
+stays as a minimum-price floor on the picked side, and entries are vetoed
+when market skew strongly opposes the momentum direction.
 
 Quote-age proxy: the archive carries no per-book exchange timestamp, so age
 is approximated as the gap since the previous snapshot of the same side.
@@ -93,6 +102,73 @@ def fetch_snapshots(hour: str, up_token, dn_token, out_path: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# BTC series (momentum validation, #1)
+# ---------------------------------------------------------------------------
+
+BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+
+
+def fetch_btc_series(start_ts: float, end_ts: float, out_path: str,
+                      symbol: str = "BTCUSDT") -> int:
+    """Fetch 1-minute BTC closes for [start_ts, end_ts] via Binance klines.
+
+    Stdlib-only (urllib). Writes {"t": open_epoch_sec, "close": px} rows as
+    JSON lines. Returns the row count.
+    """
+    import urllib.parse as _up
+    import urllib.request as _ur
+
+    out = []
+    start_ms = int(start_ts * 1000)
+    end_ms = int(end_ts * 1000)
+    while True:
+        qs = _up.urlencode({"symbol": symbol, "interval": "1m",
+                            "startTime": start_ms, "endTime": end_ms,
+                            "limit": 1000})
+        req = _ur.Request(f"{BINANCE_KLINES_URL}?{qs}",
+                          headers={"User-Agent": "btc5m-backtest/1.0"})
+        with _ur.urlopen(req, timeout=20) as resp:
+            klines = _json.loads(resp.read().decode("utf-8"))
+        if not klines:
+            break
+        for k in klines:
+            out.append({"t": k[0] / 1000.0, "close": float(k[4])})
+        if len(klines) < 1000:
+            break
+        start_ms = int(klines[-1][0]) + 60_000
+        if start_ms > end_ms:
+            break
+    _os.makedirs(_os.path.dirname(_os.path.abspath(out_path)), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        for row in out:
+            fh.write(_json.dumps(row) + "\n")
+    return len(out)
+
+
+def load_btc_series(path: str) -> list[dict]:
+    out = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                row = _json.loads(line)
+                out.append({"t": float(row["t"]), "close": float(row["close"])})
+    return sorted(out, key=lambda r: r["t"])
+
+
+def btc_at(series: list[dict], ts: float):
+    """Last series close at or before ``ts`` (None when series is empty or
+    starts after ``ts``)."""
+    px = None
+    for row in series:
+        if row["t"] <= ts:
+            px = row["close"]
+        else:
+            break
+    return px
+
+
+# ---------------------------------------------------------------------------
 # replay
 # ---------------------------------------------------------------------------
 
@@ -153,6 +229,17 @@ def replay(snapshots, params: dict) -> dict:
     max_age = params.get("max_quote_age_sec")
     end_ts = params["market_end_ts"]
     exit_ts = end_ts - exit_before
+    # Momentum-strategy mode (#1, #2, #3): side follows the BTC move since
+    # market open instead of the highest share price. Off (None) = legacy
+    # share-price trigger, kept for comparison runs.
+    btc_series = params.get("btc_series") or []
+    btc_move_min = params.get("btc_move_usd_min")
+    skew_veto_th = params.get("skew_veto_threshold", 0.10)
+    momentum_mode = bool(btc_series) and btc_move_min is not None
+    market_open_ts = end_ts - 300.0
+    btc_open = btc_at(btc_series, market_open_ts) if momentum_mode else None
+    if momentum_mode and btc_open is None and btc_series:
+        btc_open = btc_series[0]["close"]
 
     by_side = {"up": [], "dn": []}
     for s in snapshots:
@@ -188,14 +275,33 @@ def replay(snapshots, params: dict) -> dict:
                 skip("too_late_to_enter")
                 continue
             cands = []
-            for sd, top in latest.items():
-                ba = top["best_ask"]
-                if ba is not None and ba >= threshold:
-                    cands.append((sd, ba))
-            if not cands:
-                skip("below_threshold")
-                continue
-            pick_side, ask = sorted(cands, key=lambda x: x[1], reverse=True)[0]
+            btc_move = None
+            if momentum_mode:
+                from btc5m_guards import momentum_direction, skew_veto
+                btc_now = btc_at(btc_series, now)
+                mom_side, btc_move = momentum_direction(
+                    btc_open, btc_now, float(btc_move_min or 0.0))
+                if mom_side is None:
+                    skip("no_btc_momentum")
+                    continue
+                pick_side = "up" if mom_side == "UP" else "dn"
+                ask = latest[pick_side]["best_ask"]
+                if ask is None or ask < threshold:
+                    skip("below_threshold")
+                    continue
+                if skew_veto(mom_side, latest["up"]["best_ask"],
+                             latest["dn"]["best_ask"], skew_veto_th):
+                    skip("skew_veto")
+                    continue
+            else:
+                for sd, top in latest.items():
+                    ba = top["best_ask"]
+                    if ba is not None and ba >= threshold:
+                        cands.append((sd, ba))
+                if not cands:
+                    skip("below_threshold")
+                    continue
+                pick_side, ask = sorted(cands, key=lambda x: x[1], reverse=True)[0]
             top = latest[pick_side]
             spread = top["spread"]
             if max_spread is not None and spread is not None and spread > max_spread:
@@ -213,7 +319,8 @@ def replay(snapshots, params: dict) -> dict:
             shares = stake / ask if ask > 0 else 0
             in_pos = {"side": pick_side, "entry_ts": now, "entry_price": ask,
                       "shares": shares, "cost": stake,
-                      "sl_price": ask * (1.0 - sl_pct)}
+                      "sl_price": ask * (1.0 - sl_pct),
+                      "btc_move_usd_at_entry": btc_move}
         else:
             top = latest[in_pos["side"]]
             bid = top["best_bid"]
@@ -232,6 +339,7 @@ def replay(snapshots, params: dict) -> dict:
                 "exit_price": round(exit_px, 4),
                 "exit_reason": reason,
                 "pnl_usdc": round(proceeds - in_pos["cost"], 4),
+                "btc_move_usd_at_entry": in_pos.get("btc_move_usd_at_entry"),
             })
             in_pos = None
 
@@ -306,11 +414,27 @@ def main() -> None:
                      help="ISO UTC: ignore snapshots before this (default: all)")
     p_r.add_argument("--window-end", default=None,
                      help="ISO UTC: ignore snapshots after this (default: all)")
+    p_r.add_argument("--btc-series", default=None,
+                     help="JSON 1m BTC series (fetch-btc output): enables momentum mode")
+    p_r.add_argument("--btc-move-usd-min", type=float, default=None,
+                     help="Min |BTC move| since market open to allow entry (#1)")
+    p_r.add_argument("--skew-veto-threshold", type=float, default=0.10,
+                     help="Veto entry when skew opposes momentum beyond this (#2)")
+
+    p_b = sub.add_parser("fetch-btc", help="Export 1m BTC closes (Binance)")
+    p_b.add_argument("--start", required=True, help="ISO UTC range start")
+    p_b.add_argument("--end", required=True, help="ISO UTC range end")
+    p_b.add_argument("--out", required=True)
     args = ap.parse_args()
 
     if args.cmd == "fetch":
         n = fetch_snapshots(args.hour, args.up_token, args.dn_token, args.out)
         print(f"exported {n} book snapshots -> {args.out}")
+        return
+
+    if args.cmd == "fetch-btc":
+        n = fetch_btc_series(parse_ts(args.start), parse_ts(args.end), args.out)
+        print(f"exported {n} BTC 1m closes -> {args.out}")
         return
 
     snaps = load_snapshots(args.snapshots)
@@ -330,6 +454,9 @@ def main() -> None:
         "min_top_ask_notional_usd": args.min_top_ask_notional_usd,
         "max_quote_age_sec": args.max_quote_age_sec,
         "market_end_ts": parse_ts(args.market_end),
+        "btc_series": load_btc_series(args.btc_series) if args.btc_series else [],
+        "btc_move_usd_min": args.btc_move_usd_min,
+        "skew_veto_threshold": args.skew_veto_threshold,
     })
     print(_json.dumps({"metrics": res["metrics"], "skips": res["skips"],
                          "trades": res["trades"]}, indent=2))

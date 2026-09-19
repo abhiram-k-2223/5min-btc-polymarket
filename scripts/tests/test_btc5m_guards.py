@@ -99,5 +99,27 @@ class GateTest(unittest.TestCase):
         self.assertTrue(g.error_budget_exceeded(10, 3))
 
 
+class MomentumSkewTest(unittest.TestCase):
+    def test_momentum_direction(self):
+        self.assertEqual(g.momentum_direction(100000, 100100, 70), ("UP", 100.0))
+        self.assertEqual(g.momentum_direction(100100, 100000, 70), ("DOWN", -100.0))
+        # below minimum move: no trade
+        self.assertIsNone(g.momentum_direction(100000, 100050, 70)[0])
+        # bad inputs fail closed (no side), move reported as 0.0
+        self.assertEqual(g.momentum_direction(None, 100000, 70), (None, 0.0))
+
+    def test_skew_veto(self):
+        # crowd agrees: no veto
+        self.assertFalse(g.skew_veto("UP", 0.72, 0.30, 0.10))
+        # mild disagreement within tolerance: no veto
+        self.assertFalse(g.skew_veto("UP", 0.45, 0.50, 0.10))
+        # strong opposition beyond veto: veto
+        self.assertTrue(g.skew_veto("UP", 0.30, 0.72, 0.10))
+        self.assertTrue(g.skew_veto("DOWN", 0.72, 0.30, 0.10))
+        # unknown prices fail open
+        self.assertFalse(g.skew_veto("UP", None, 0.30, 0.10))
+        self.assertFalse(g.skew_veto("SIDEWAYS", 0.7, 0.3, 0.10))
+
+
 if __name__ == "__main__":
     unittest.main()

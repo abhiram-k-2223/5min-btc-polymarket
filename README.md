@@ -6,7 +6,7 @@ Repository: https://github.com/Novals83/5min-btc-polymarket
 
 ## Recent Fixes
 A repo audit surfaced ~30 execution, risk, and ops gaps; the following are
-now fixed and covered by 60 unit tests (`scripts/tests/`):
+now fixed and covered by 71 unit tests (`scripts/tests/`):
 - Daily loss cap + max trades/day enforced via a JSON risk ledger (live trades only)
 - Pre-entry spread / liquidity / quote-staleness gates on the CLOB book
 - Consecutive-error abort, and a machine-readable `decision` field the watcher stops on
@@ -17,6 +17,7 @@ now fixed and covered by 60 unit tests (`scripts/tests/`):
 - Pinned `requirements.txt`, working Dockerfile/compose, log-hygiene fixes
 - Profiles actually differ (conservative: 0.70 threshold, strict guards, 8%-of-equity stake capped at $8; aggressive: 0.65 threshold, looser guards, 15% capped at $15) with equity-derived sizing (`--risk-per-trade-pct`, `--max-notional-usd`)
 - Graceful shutdown (SIGTERM/SIGINT runs the close cascade; `ctl.sh stop` waits ~30s before SIGKILL), proportional force-close pricing, and a live fire-once micro-hedge with combined PnL
+- Momentum entry matching the documented strategy: side follows the BTC move since market open (Binance 1m klines, `--btc-move-usd-min` 70/50), threshold is a price floor, skew veto blocks entries against crowd flow (`--skew-veto-threshold` 0.10/0.15); `--disable-momentum` restores the legacy trigger
 
 More problems from the audit are still being worked through — strategy edges,
 order-book depth modeling, and remaining ops items. Contributions welcome.

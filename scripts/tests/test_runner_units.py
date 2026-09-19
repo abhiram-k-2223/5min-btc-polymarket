@@ -349,5 +349,72 @@ class OpsHelpersTest(unittest.TestCase):
             r.requests.get = orig
 
 
+class MomentumHelpersTest(unittest.TestCase):
+    """Binance klines helpers + momentum profile wiring (#1, #2, #3)."""
+
+    def test_fetch_klines_parses(self):
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return [[1700000000000, "1", "2", "3", "97500.5", "9"],
+                        ["bad-row"],
+                        [1700000060000, "1", "2", "3", "97600.0", "9"]]
+
+        orig = r.requests.get
+        r.requests.get = lambda *a, **k: Resp()
+        try:
+            rows = r.fetch_btc_klines_1m(1700000000.0, 1700000120.0)
+        finally:
+            r.requests.get = orig
+        self.assertEqual(rows, [(1700000000.0, 97500.5), (1700000060.0, 97600.0)])
+
+    def test_fetch_klines_empty_on_error(self):
+        orig = r.requests.get
+        r.requests.get = lambda *a, **k: (_ for _ in ()).throw(IOError("down"))
+        try:
+            self.assertEqual(r.fetch_btc_klines_1m(1.0, 2.0), [])
+        finally:
+            r.requests.get = orig
+
+    def test_btc_close_at(self):
+        rows = [(100.0, 90.0), (160.0, 95.0), (220.0, 99.0)]
+        self.assertIsNone(r.btc_close_at(rows, 50.0))
+        self.assertEqual(r.btc_close_at(rows, 160.0), 95.0)
+        self.assertEqual(r.btc_close_at(rows, 200.0), 95.0)
+        self.assertEqual(r.btc_close_at([], 200.0), None)
+
+    def test_series_cached_serves_cache_without_network(self):
+        r._btc_klines_cache['ut-slug'] = (9999999999.0, [(1.0, 50.0)])
+        orig = r.requests.get
+        r.requests.get = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not hit network"))
+        try:
+            self.assertEqual(r.btc_series_cached('ut-slug', 0.0, 2.0),
+                             [(1.0, 50.0)])
+        finally:
+            r.requests.get = orig
+            del r._btc_klines_cache['ut-slug']
+
+    def test_profile_momentum_defaults(self):
+        self.assertEqual((r.PROFILES['conservative']['btc_move_usd_min'],
+                          r.PROFILES['conservative']['skew_veto_threshold']),
+                         (70.0, 0.10))
+        self.assertEqual((r.PROFILES['aggressive']['btc_move_usd_min'],
+                          r.PROFILES['aggressive']['skew_veto_threshold']),
+                         (50.0, 0.15))
+
+    def test_disable_momentum_clears_threshold(self):
+        ns = argparse.Namespace(profile='conservative',
+                                disable_momentum=True, stake_usd=None)
+        out = r.apply_profile(ns)
+        self.assertIsNone(out.btc_move_usd_min)
+        ns2 = argparse.Namespace(profile='conservative',
+                                 disable_momentum=False, stake_usd=None,
+                                 btc_move_usd_min=None, skew_veto_threshold=None)
+        out2 = r.apply_profile(ns2)
+        self.assertEqual(out2.btc_move_usd_min, 70.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -171,7 +171,44 @@ class BacktestTest(unittest.TestCase):
         self.assertAlmostEqual(
             backtest.parse_ts("2026-09-18T19:25:00Z"), 1789759500.0)
 
-    def test_token_to_asset_hex(self):        self.assertEqual(
+    def _mom_params(self, series, **kw):
+        p = self._params(**kw)
+        p.update({"btc_series": series, "btc_move_usd_min": 70.0,
+                  "skew_veto_threshold": 0.10})
+        return p
+
+    def test_momentum_entry_follows_btc(self):
+        series = [{"t": 700.0, "close": 100000.0},
+                  {"t": 750.0, "close": 100100.0},
+                  {"t": 990.0, "close": 100120.0}]
+        snaps = self._both_sides(range(100, 1000, 10))
+        res = backtest.replay(snaps, self._mom_params(series))
+        self.assertEqual(res["metrics"]["n_trades"], 1)
+        t = res["trades"][0]
+        self.assertEqual(t["side"], "up")
+        self.assertAlmostEqual(t["btc_move_usd_at_entry"], 100.0)
+        self.assertGreater(res["skips"].get("no_btc_momentum", 0), 0)
+
+    def test_momentum_veto_on_opposing_skew(self):
+        series = [{"t": 700.0, "close": 100000.0},
+                  {"t": 750.0, "close": 100100.0},
+                  {"t": 990.0, "close": 100120.0}]
+        snaps = []
+        for t in range(100, 1000, 10):
+            snaps.append(self._snap(t, "up", 0.70, 0.72))
+            snaps.append(self._snap(t, "dn", 0.80, 0.85))
+        res = backtest.replay(snaps, self._mom_params(series))
+        self.assertEqual(res["metrics"]["n_trades"], 0)
+        self.assertGreater(res["skips"].get("skew_veto", 0), 0)
+
+    def test_legacy_mode_ignores_btc(self):
+        snaps = self._both_sides(range(100, 1000, 10))
+        res = backtest.replay(snaps, self._params())
+        self.assertEqual(res["metrics"]["n_trades"], 1)
+        self.assertIsNone(res["trades"][0]["btc_move_usd_at_entry"])
+
+    def test_token_to_asset_hex(self):
+        self.assertEqual(
             backtest.token_to_asset_hex(
                 85626091783806950319755530089519759177231513702682138920823697838429460066490),
             "bd4ea68709c90f30fba96735bd0f64ee4b29d928622d33de401ab6b23e1170ba")

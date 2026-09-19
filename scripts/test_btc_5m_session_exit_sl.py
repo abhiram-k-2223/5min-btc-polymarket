@@ -22,11 +22,13 @@ from btc5m_guards import (
     liquidity_gate,
     load_ledger,
     load_open_position,
+    momentum_direction,
     position_in_tokens,
     record_close,
     record_open,
     save_ledger,
     save_open_position,
+    skew_veto,
     spread_gate,
     staleness_gate,
     utc_today,
@@ -103,6 +105,60 @@ def wallet_positions(wallet: str, timeout: float = 10.0) -> list:
         return obj if isinstance(obj, list) else []
     except Exception:
         return []
+
+
+BINANCE_KLINES_URL = 'https://api.binance.com/api/v3/klines'
+
+# Per-market 1m BTC close cache (#1): refreshed at most every 30s so each
+# poll does not cost an HTTP round-trip.
+_btc_klines_cache: dict[str, tuple[float, list]] = {}
+
+
+def fetch_btc_klines_1m(start_ts: float, end_ts: float,
+                        timeout: float = 10.0) -> list:
+    """1-minute (open_epoch, close) BTC klines via Binance (#1, momentum
+    reference). Returns [] on any failure — callers fail closed."""
+    try:
+        r = requests.get(BINANCE_KLINES_URL,
+                         params={'symbol': 'BTCUSDT', 'interval': '1m',
+                                 'startTime': int(start_ts * 1000),
+                                 'endTime': int(end_ts * 1000), 'limit': 1000},
+                         timeout=timeout)
+        if r.status_code != 200:
+            return []
+        out = []
+        for k in r.json():
+            try:
+                out.append((float(k[0]) / 1000.0, float(k[4])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        return out
+    except Exception:
+        return []
+
+
+def btc_series_cached(slug: str, start_ts: float, end_ts: float,
+                      max_age_sec: float = 30.0) -> list:
+    now = time.time()
+    hit = _btc_klines_cache.get(slug)
+    if hit and (now - hit[0]) < max_age_sec and hit[1]:
+        return hit[1]
+    rows = fetch_btc_klines_1m(start_ts, end_ts)
+    if rows:
+        _btc_klines_cache[slug] = (now, rows)
+        return rows
+    return hit[1] if hit else []
+
+
+def btc_close_at(rows: list, ts: float) -> Optional[float]:
+    """Last series close at or before ``ts`` (None when unavailable)."""
+    px = None
+    for t, c in rows:
+        if t <= ts:
+            px = c
+        else:
+            break
+    return px
 
 
 def parse_json_objects(text: str) -> list[dict[str, Any]]:
@@ -660,6 +716,11 @@ PROFILES: dict[str, dict[str, Any]] = {
         'hedge_share_pct': 3.0,
         'hedge_min_notional_usd': 1.0,
         'hedge_max_notional_usd': 2.0,
+        # Momentum-strategy entry (mirror config strategy_reference): BTC
+        # must move >= $70 in the interval; skew veto blocks entries
+        # against strong crowd flow (#1, #2, #3).
+        'btc_move_usd_min': 70.0,
+        'skew_veto_threshold': 0.10,
     },
     # Aggressive: higher frequency (lower threshold, looser guards) and
     # higher risk (15% of equity, capped at $15) (#10, #11).
@@ -685,6 +746,10 @@ PROFILES: dict[str, dict[str, Any]] = {
         'hedge_share_pct': 5.0,
         'hedge_min_notional_usd': 1.0,
         'hedge_max_notional_usd': 3.0,
+        # Momentum entry is looser (mirror config): $50 move suffices, and
+        # the skew veto tolerates more disagreement (#1, #2, #3).
+        'btc_move_usd_min': 50.0,
+        'skew_veto_threshold': 0.15,
     },
 }
 
@@ -718,8 +783,14 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
         ('hedge_share_pct', float),
         ('hedge_min_notional_usd', float),
         ('hedge_max_notional_usd', float),
+        ('btc_move_usd_min', float),
+        ('skew_veto_threshold', float),
     ):
         _apply_profile_value(args, name, cast)
+    if getattr(args, 'disable_momentum', False):
+        # --disable-momentum restores the legacy highest-ask trigger (#3
+        # escape hatch for comparison runs).
+        args.btc_move_usd_min = None
     # NOTE: stake_usd is intentionally NOT profile-filled. It is an
     # explicit override only; when unset, resolve_stake_usd() derives the
     # stake from equity x risk_per_trade_pct capped at max_notional_usd.
@@ -904,6 +975,9 @@ def main():
     ap.add_argument('--force-close-max-discount-abs', type=float, default=0.02, help='Cap (in price points) on the last-resort exit discount (#12)')
     ap.add_argument('--disable-hedge', action='store_true', help='Do not place the micro-hedge even when its trigger fires (#13)')
     ap.add_argument('--hedge-trigger-price', type=float, default=None, help='Place the micro-hedge once the held side bid reaches this (default: 0.95 conservative, 0.93 aggressive)')
+    ap.add_argument('--btc-move-usd-min', type=float, default=None, help='Min |BTC move| since market open to allow entry; side follows the move (default: 70 conservative, 50 aggressive; #1, #3)')
+    ap.add_argument('--skew-veto-threshold', type=float, default=None, help='Veto entry when skew opposes momentum beyond this (default: 0.10 conservative, 0.15 aggressive; #2)')
+    ap.add_argument('--disable-momentum', action='store_true', help='Restore the legacy highest-ask entry trigger (comparison runs only; #3)')
     ap.add_argument('--hedge-trigger-seconds-left', type=int, default=None, help='... and at most this many seconds remain (default: 45 conservative, 50 aggressive)')
     ap.add_argument('--hedge-share-pct', type=float, default=None, help='Hedge notional as pct of main cost (default: 3 conservative, 5 aggressive)')
     ap.add_argument('--hedge-min-notional-usd', type=float, default=None, help='Floor on hedge notional (default 1.0)')
@@ -967,6 +1041,9 @@ def main():
             'hedge_max_notional_usd': args.hedge_max_notional_usd,
             'force_close_discount_pct': args.force_close_discount_pct,
             'force_close_max_discount_abs': args.force_close_max_discount_abs,
+            'btc_move_usd_min': args.btc_move_usd_min,
+            'skew_veto_threshold': args.skew_veto_threshold,
+            'disable_momentum': args.disable_momentum,
         },
         'attempts': [],
         'attempts_dropped': 0,
@@ -1106,27 +1183,90 @@ def main():
                 'quote_age_known': snap['quote_age_known'],
             })
 
-            candidates: list[tuple[str, float]] = []
-            if up_ask is not None and float(up_ask) >= args.threshold:
-                candidates.append(('UP', float(up_ask)))
-            if dn_ask is not None and float(dn_ask) >= args.threshold:
-                candidates.append(('DOWN', float(dn_ask)))
+            # Momentum-strategy entry (#1, #2, #3): the side follows the BTC
+            # move since market open (it must clear --btc-move-usd-min);
+            # --threshold stays as a minimum-price floor on the picked side;
+            # --skew-veto-threshold blocks entries against strong crowd flow.
+            # With --disable-momentum the legacy highest-ask trigger applies.
+            btc_move: Optional[float] = None
+            btc_dir = None
+            side = None
+            trigger_price = None
+            if args.btc_move_usd_min is not None:
+                m_open_ts = end_ts - 300.0 if end_ts else None
+                btc_rows = (btc_series_cached(slug, m_open_ts, time.time())
+                            if m_open_ts else [])
+                btc_open_px = btc_close_at(btc_rows, m_open_ts) if m_open_ts else None
+                btc_now_px = btc_close_at(btc_rows, time.time())
+                if btc_now_px is None:
+                    btc_now_px = btc_spot_usd()
+                mom_side, btc_move = momentum_direction(
+                    btc_open_px, btc_now_px, args.btc_move_usd_min)
+                btc_dir = mom_side
+                if mom_side is None:
+                    log_attempt(report, {
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'skip_no_btc_momentum',
+                        'btc_move_usd': btc_move,
+                        'btc_move_usd_min': args.btc_move_usd_min,
+                        'seconds_left': sec_left,
+                    })
+                    err_streak = 0
+                    time.sleep(args.poll_sec)
+                    continue
+                side = mom_side
+                snap_side = 'up' if side == 'UP' else 'dn'
+                trigger_price = snap[f'{snap_side}_ask']
+                if trigger_price is None or float(trigger_price) < args.threshold:
+                    log_attempt(report, {
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'skip_price_below_threshold',
+                        'threshold': args.threshold,
+                        'side': side,
+                        'btc_move_usd': btc_move,
+                        'seconds_left': sec_left,
+                    })
+                    err_streak = 0
+                    time.sleep(args.poll_sec)
+                    continue
+                if skew_veto(side, up_ask, dn_ask, args.skew_veto_threshold):
+                    log_attempt(report, {
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'skip_skew_veto',
+                        'side': side,
+                        'btc_move_usd': btc_move,
+                        'clob_up_ask': up_ask,
+                        'clob_down_ask': dn_ask,
+                        'seconds_left': sec_left,
+                    })
+                    err_streak = 0
+                    time.sleep(args.poll_sec)
+                    continue
+            else:
+                candidates: list[tuple[str, float]] = []
+                if up_ask is not None and float(up_ask) >= args.threshold:
+                    candidates.append(('UP', float(up_ask)))
+                if dn_ask is not None and float(dn_ask) >= args.threshold:
+                    candidates.append(('DOWN', float(dn_ask)))
 
-            if not candidates:
-                log_attempt(report, {
-                    'ts': ts_utc(),
-                    'slug': slug,
-                    'status': 'skip_price_below_threshold',
-                    'threshold': args.threshold,
-                    'clob_up_ask': up_ask,
-                    'clob_down_ask': dn_ask,
-                    'seconds_left': sec_left,
-                })
-                err_streak = 0
-                time.sleep(args.poll_sec)
-                continue
+                if not candidates:
+                    log_attempt(report, {
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'skip_price_below_threshold',
+                        'threshold': args.threshold,
+                        'clob_up_ask': up_ask,
+                        'clob_down_ask': dn_ask,
+                        'seconds_left': sec_left,
+                    })
+                    err_streak = 0
+                    time.sleep(args.poll_sec)
+                    continue
 
-            side, trigger_price = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
+                side, trigger_price = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
 
             # Pre-entry execution guards (#6, #7, #8) on the picked side.
             snap_side = 'up' if side == 'UP' else 'dn'
@@ -1155,6 +1295,7 @@ def main():
                     'side': side,
                     'side_spread': side_spread,
                     'side_ask_notional_usd': side_notional,
+                    'btc_move_usd': btc_move,
                     'quote_age_sec': snap['quote_age_sec'],
                     'quote_age_known': snap['quote_age_known'],
                 })
@@ -1221,6 +1362,10 @@ def main():
                     'hedge_token_id': str(dn_t if side == 'UP' else up_t) if (dn_t if side == 'UP' else up_t) else None,
                     'hedge_placed': False,
                     'hedge_attempted': False,
+                    # Momentum context (#1, #2, #3): BTC move that
+                    # authorized this entry (None in legacy trigger mode).
+                    'btc_move_usd_at_entry': btc_move,
+                    'btc_direction_at_entry': btc_dir,
                 }
                 report['open_raw'] = out[-4000:]
                 # Machine-readable outcome for watchers (#29): the watcher
