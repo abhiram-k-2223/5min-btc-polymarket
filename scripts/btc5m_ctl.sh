@@ -142,7 +142,13 @@ cmd_stop() {
   local pid
   pid="$(cat "$PIDFILE")"
   kill "$pid" || true
-  sleep 1
+  # Graceful shutdown (#14): the runner traps SIGTERM and exits through
+  # the close cascade, so give it up to ~30s before escalating to SIGKILL.
+  local waited=0
+  while ps -p "$pid" >/dev/null 2>&1 && [[ "$waited" -lt 30 ]]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
   if ps -p "$pid" >/dev/null 2>&1; then
     kill -9 "$pid" || true
   fi

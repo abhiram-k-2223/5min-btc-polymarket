@@ -105,6 +105,7 @@ class ProfileTest(unittest.TestCase):
     def _ns(self, **kw):
         base = dict(
             profile="conservative", threshold=None, stake_usd=None,
+            risk_per_trade_pct=None, max_notional_usd=None,
             stop_loss_pct=None, exit_before_sec=None,
             min_entry_seconds_left=None, entry_timeout_min=None, poll_sec=None,
             max_spread=None, min_top_ask_notional_usd=None,
@@ -116,23 +117,146 @@ class ProfileTest(unittest.TestCase):
 
     def test_conservative_defaults(self):
         a = r.apply_profile(self._ns())
-        self.assertEqual((a.threshold, a.stake_usd, a.stop_loss_pct), (0.70, 5.0, 0.25))
+        self.assertEqual((a.threshold, a.stop_loss_pct), (0.70, 0.25))
         self.assertEqual((a.max_spread, a.min_top_ask_notional_usd, a.max_quote_age_sec), (0.03, 30.0, 8.0))
         self.assertEqual((a.max_consecutive_errors, a.max_trades_per_day), (3, 12))
         self.assertEqual((a.daily_max_loss_pct, a.equity_usd), (10.0, 100.0))
+        self.assertEqual((a.risk_per_trade_pct, a.max_notional_usd), (8.0, 8.0))
+        # stake_usd is explicit-override-only: profile fill must leave it None
+        self.assertIsNone(a.stake_usd)
 
     def test_aggressive_differs_where_intended(self):
         a = r.apply_profile(self._ns(profile="aggressive"))
-        self.assertEqual(a.stop_loss_pct, 0.30)
+        self.assertEqual((a.threshold, a.stop_loss_pct), (0.65, 0.30))
         self.assertEqual(a.max_trades_per_day, 20)
         self.assertEqual(a.daily_max_loss_pct, 15.0)
-        # shared execution guards stay identical
-        self.assertEqual((a.max_spread, a.min_top_ask_notional_usd), (0.03, 30.0))
+        self.assertEqual((a.risk_per_trade_pct, a.max_notional_usd), (15.0, 15.0))
+        # looser execution guards = higher frequency
+        self.assertEqual((a.max_spread, a.min_top_ask_notional_usd, a.max_quote_age_sec), (0.05, 20.0, 12.0))
 
     def test_explicit_cli_values_preserved(self):
         a = r.apply_profile(self._ns(threshold=0.65, max_trades_per_day=5))
         self.assertEqual(a.threshold, 0.65)
         self.assertEqual(a.max_trades_per_day, 5)
+
+
+class StakeResolutionTest(unittest.TestCase):
+    """Equity-based sizing (#11): explicit wins, else equity x pct capped."""
+
+    def _ns(self, **kw):
+        base = dict(stake_usd=None, equity_usd=100.0,
+                    risk_per_trade_pct=8.0, max_notional_usd=8.0)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_equity_pct_capped(self):
+        stake, basis = r.resolve_stake_usd(self._ns())
+        self.assertEqual((stake, basis), (8.0, "equity_pct"))
+
+    def test_equity_growth_moves_stake(self):
+        stake, _ = r.resolve_stake_usd(self._ns(equity_usd=200.0))
+        self.assertEqual(stake, 8.0)  # capped at max_notional
+        stake, _ = r.resolve_stake_usd(
+            self._ns(equity_usd=200.0, max_notional_usd=30.0))
+        self.assertEqual(stake, 16.0)  # 200 x 8%
+
+    def test_equity_shrinkage_moves_stake(self):
+        stake, _ = r.resolve_stake_usd(self._ns(equity_usd=50.0))
+        self.assertEqual(stake, 4.0)  # 50 x 8%
+
+    def test_aggressive_profile_stake(self):
+        stake, _ = r.resolve_stake_usd(self._ns(equity_usd=100.0,
+                                                risk_per_trade_pct=15.0,
+                                                max_notional_usd=15.0))
+        self.assertEqual(stake, 15.0)
+
+    def test_explicit_override_wins(self):
+        stake, basis = r.resolve_stake_usd(self._ns(stake_usd=5.0))
+        self.assertEqual((stake, basis), (5.0, "explicit"))
+
+    def test_floor_and_bad_input(self):
+        stake, basis = r.resolve_stake_usd(self._ns(equity_usd=0.0))
+        self.assertEqual((stake, basis), (r.MIN_STAKE_USD, "equity_pct"))
+        stake, _ = r.resolve_stake_usd(self._ns(equity_usd=None,
+                                                risk_per_trade_pct=None,
+                                                max_notional_usd=None))
+        self.assertEqual(stake, r.MIN_STAKE_USD)
+
+
+class ExitAndHedgeTest(unittest.TestCase):
+    """Proportional force-close (#12), micro-hedge sizing/trigger (#13),
+    signal handling (#14). All pure/offline."""
+
+    def test_force_close_price_scales(self):
+        # cap binds at high prices (as before), pct binds at low prices
+        for bid, want in ((0.70, 0.68), (0.10, 0.09)):
+            px = r.force_close_price(bid)
+            assert px is not None
+            self.assertAlmostEqual(px, want)
+        px = r.force_close_price(0.03)
+        assert px is not None
+        self.assertAlmostEqual(px, 0.027)
+        self.assertIsNone(r.force_close_price(None))
+        self.assertIsNone(r.force_close_price(0))
+        self.assertIsNone(r.force_close_price("junk"))
+
+    def test_hedge_sizing_clamped(self):
+        # 3% of 5.0 = 0.15 -> floored to min 1.0
+        self.assertEqual(r.hedge_sizing(5.0), 1.0)
+        # 5% of 100 = 5 -> capped at 3.0
+        self.assertEqual(
+            r.hedge_sizing(100.0, share_pct=5.0, max_notional_usdc=3.0), 3.0)
+        self.assertEqual(r.hedge_sizing(0), 0.0)
+        self.assertEqual(r.hedge_sizing(None), 0.0)
+
+    def _trig(self, bid, sec, enabled=True, tried=False, tok="t"):
+        return r.hedge_triggered(
+            bid, sec, trigger_price=0.95, trigger_seconds_left=45,
+            enabled=enabled, already_placed_or_attempted=tried,
+            hedge_token_id=tok)
+
+    def test_hedge_triggered_matrix(self):
+        self.assertTrue(self._trig(0.96, 30))
+        self.assertFalse(self._trig(0.90, 30))  # bid too low
+        self.assertFalse(self._trig(0.96, 60))  # too early
+        self.assertFalse(self._trig(0.96, None))  # unknown time
+        self.assertFalse(self._trig(None, 30))  # unknown bid
+        self.assertFalse(self._trig(0.96, 30, enabled=False))
+        self.assertFalse(self._trig(0.96, 30, tried=True))
+        self.assertFalse(r.hedge_triggered(
+            0.96, 30, trigger_price=0.95, trigger_seconds_left=45,
+            enabled=True, already_placed_or_attempted=False,
+            hedge_token_id=None))
+
+    def test_signal_handler_flag_and_escalation(self):
+        old = r._shutdown_requested
+        r._shutdown_requested = False
+        try:
+            r.request_shutdown(15, None)
+            self.assertTrue(r._shutdown_requested)
+            with self.assertRaises(SystemExit):
+                r.request_shutdown(15, None)
+        finally:
+            r._shutdown_requested = old
+
+    def test_install_signal_handlers_never_raises(self):
+        try:
+            r.install_signal_handlers()
+        except Exception as e:  # pragma: no cover - defensive
+            self.fail(f"install_signal_handlers raised {e!r}")
+
+    def test_profile_hedge_defaults(self):
+        a = r.apply_profile(argparse.Namespace(profile="conservative"))
+        self.assertEqual(
+            (a.hedge_trigger_price, a.hedge_trigger_seconds_left), (0.95, 45))
+        self.assertEqual(
+            (a.hedge_share_pct, a.hedge_min_notional_usd,
+             a.hedge_max_notional_usd), (3.0, 1.0, 2.0))
+        b = r.apply_profile(argparse.Namespace(profile="aggressive"))
+        self.assertEqual(
+            (b.hedge_trigger_price, b.hedge_trigger_seconds_left), (0.93, 50))
+        self.assertEqual((b.hedge_share_pct, b.hedge_max_notional_usd),
+                         (5.0, 3.0))
 
 
 class LogAttemptCapTest(unittest.TestCase):

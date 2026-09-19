@@ -370,15 +370,21 @@ def run_open(
     execute: bool,
     max_spread: float | None = None,
     min_top_ask_notional_usd: float | None = None,
+    equity_usd: float = 100.0,
+    max_notional_usd: float | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
+    try:
+        equity = float(equity_usd) if float(equity_usd) > 0 else 100.0
+    except (TypeError, ValueError):
+        equity = 100.0
     cmd = [
         '.venv/bin/python',
         'src/live/pm_live_trade_runner.py',
         '--market-slug', slug,
         '--force-side', side,
-        '--start-equity', '100',
-        '--risk-frac', str(stake / 100.0),
-        '--max-notional-usd', str(stake),
+        '--start-equity', str(equity),
+        '--risk-frac', str(float(stake) / equity),
+        '--max-notional-usd', str(max_notional_usd if max_notional_usd else stake),
     ]
     if execute:
         cmd.append('--execute')
@@ -426,6 +432,189 @@ def run_close(
     return out, parse_json_objects(out)
 
 
+def close_position(
+    repo: str,
+    slug: str,
+    side: str,
+    token_id: str,
+    shares: float,
+    execute: bool,
+    close_retry_max: int = 18,
+    close_retry_delay_sec: float = 2.0,
+    force_discount_pct: float = 0.10,
+    force_max_discount_abs: float = 0.02,
+    last_side_price=None,
+    entry_price=None,
+    label: str = 'main',
+) -> tuple[dict[str, Any], str, list[dict[str, Any]], Any, Any]:
+    """Shared exit cascade (#13 extraction): FAK -> GTC-limit near the
+    executable price -> poll/cancel/repost aggressive (FORCE_GTC with the
+    proportional #12 pricing). Used for both the main exit and the
+    micro-hedge exit; debug entries carry ``leg`` so the two are
+    distinguishable in the report. Returns
+    (close_obj, raw_out, close_debug, fallback_used, force_close_used).
+    """
+    close_debug: list[dict[str, Any]] = []
+    close_obj: dict[str, Any] = {}
+    out = ''
+    fallback_used = None
+    force_close_used = None
+    client = auth_clob_client()
+
+    def _dbg(entry: dict[str, Any]) -> None:
+        entry['leg'] = label
+        close_debug.append(entry)
+
+    for i in range(max(1, int(close_retry_max))):
+        out, objs = run_close(
+            repo,
+            slug,
+            token_id,
+            shares,
+            execute,
+            close_order_type='FAK',
+        )
+        close_obj = objs[-1] if objs else {}
+        post = close_obj.get('order_post_result') or {}
+        status = str(post.get('status') or '').lower()
+        skipped = str(close_obj.get('close_skipped') or '')
+        _dbg({
+            'ts': ts_utc(),
+            'attempt': i + 1,
+            'order_type': 'FAK',
+            'status': status,
+            'close_skipped': skipped,
+        })
+        if post.get('success') is True and status == 'matched':
+            break
+
+        # common transient path right after open: token balance not yet visible
+        if skipped == 'zero_effective_shares':
+            time.sleep(float(close_retry_delay_sec))
+            continue
+
+        # fallback: if FAK has no instant match, try a GTC limit close near current side price
+        txt = ((out or '') + '\n' + json.dumps(close_obj, ensure_ascii=False)).lower()
+        if 'no orders found to match with fak order' in txt:
+            bb = None
+            try:
+                bb = clob_best_bid(token_id)
+            except Exception:
+                bb = None
+            # Prefer the executable bid; fall back to Gamma mid, then the
+            # last monitored price, then the entry price.
+            px = bb
+            if px is None:
+                px = get_side_price_from_slug(slug, side)
+            if px is None:
+                px = last_side_price
+            if px is None:
+                px = entry_price
+            if px is None:
+                # No price reference at all (previously a TypeError crash);
+                # rest a coin-flip GTC and note the unknown reference.
+                px = 0.5
+                fallback_used = {'type': 'GTC_LIMIT', 'price': None,
+                                 'price_unknown': True}
+            limit_px = max(0.01, min(0.99, float(px - 0.01)))
+            if fallback_used is None:
+                fallback_used = {'type': 'GTC_LIMIT', 'price': limit_px}
+            out2, objs2 = run_close(
+                repo,
+                slug,
+                token_id,
+                shares,
+                execute,
+                close_order_type='GTC',
+                close_limit_price=limit_px,
+            )
+            close_obj2 = objs2[-1] if objs2 else {}
+            post2 = close_obj2.get('order_post_result') or {}
+            status2 = str(post2.get('status') or '').lower()
+            _dbg({
+                'ts': ts_utc(),
+                'attempt': i + 1,
+                'order_type': 'GTC',
+                'status': status2,
+                'close_skipped': str(close_obj2.get('close_skipped') or ''),
+                'limit_price': limit_px,
+            })
+            close_obj = close_obj2
+            out = out2
+            if post2.get('success') is True and status2 == 'matched':
+                break
+
+            # If GTC is accepted but still live, force-close flow: poll status, cancel, repost aggressive.
+            if post2.get('success') is True and status2 == 'live':
+                oid2 = str(post2.get('orderID') or '')
+                st_upd, ord_upd = poll_order_status(client, oid2, wait_sec=min(8.0, max(2.0, float(close_retry_delay_sec) * 2)), step_sec=1.0)
+                _dbg({
+                    'ts': ts_utc(),
+                    'attempt': i + 1,
+                    'order_type': 'GTC_POLL',
+                    'status': st_upd.lower() if st_upd else '',
+                    'order_id': oid2,
+                })
+                if st_upd == 'MATCHED':
+                    post2['status'] = 'matched'
+                    close_obj['order_post_result'] = post2
+                    break
+
+                cancel_info = cancel_token_orders(client, token_id)
+                bb2 = None
+                try:
+                    bb2 = clob_best_bid(token_id)
+                except Exception:
+                    bb2 = None
+                # Last-resort price: proportional discount off the executable
+                # bid (#12), walking executable bid -> last monitored price
+                # -> entry price before giving up at 0.01.
+                force_px = (
+                    force_close_price(bb2, force_discount_pct,
+                                      force_max_discount_abs)
+                    or force_close_price(last_side_price,
+                                         force_discount_pct,
+                                         force_max_discount_abs)
+                    or force_close_price(entry_price,
+                                         force_discount_pct,
+                                         force_max_discount_abs)
+                    or 0.01
+                )
+                force_close_used = {
+                    'type': 'FORCE_GTC_LIMIT',
+                    'price': force_px,
+                    'cancel_info': cancel_info,
+                }
+                out3, objs3 = run_close(
+                    repo,
+                    slug,
+                    token_id,
+                    shares,
+                    execute,
+                    close_order_type='GTC',
+                    close_limit_price=force_px,
+                )
+                close_obj3 = objs3[-1] if objs3 else {}
+                post3 = close_obj3.get('order_post_result') or {}
+                status3 = str(post3.get('status') or '').lower()
+                _dbg({
+                    'ts': ts_utc(),
+                    'attempt': i + 1,
+                    'order_type': 'FORCE_GTC',
+                    'status': status3,
+                    'close_skipped': str(close_obj3.get('close_skipped') or ''),
+                    'limit_price': force_px,
+                })
+                close_obj = close_obj3
+                out = out3
+                if post3.get('success') is True and status3 == 'matched':
+                    break
+
+        time.sleep(float(close_retry_delay_sec))
+
+    return close_obj, out, close_debug, fallback_used, force_close_used
+
+
 def get_side_price_from_slug(slug: str, side: str) -> Optional[float]:
     try:
         ev = fetch_event(slug)
@@ -441,9 +630,10 @@ def get_side_price_from_slug(slug: str, side: str) -> Optional[float]:
 
 
 PROFILES: dict[str, dict[str, Any]] = {
+    # Conservative: strict filters, lower per-trade risk (#10, #11).
+    # Stake is equity-derived (8% of equity, capped at $8), NOT fixed.
     'conservative': {
         'threshold': 0.70,
-        'stake_usd': 5.0,
         'stop_loss_pct': 0.25,
         'exit_before_sec': 20,
         'min_entry_seconds_left': 60,
@@ -458,22 +648,43 @@ PROFILES: dict[str, dict[str, Any]] = {
         'max_trades_per_day': 12,
         'daily_max_loss_pct': 10.0,
         'equity_usd': 100.0,
+        # Equity-based sizing (mirror config profiles sizing).
+        'risk_per_trade_pct': 8.0,
+        'max_notional_usd': 8.0,
+        # Micro-hedge: small opposite-side position when the held side
+        # looks almost certain, guarding late-reversal tail risk (#13;
+        # mirrors config profiles hedge).
+        'hedge_enabled': True,
+        'hedge_trigger_price': 0.95,
+        'hedge_trigger_seconds_left': 45,
+        'hedge_share_pct': 3.0,
+        'hedge_min_notional_usd': 1.0,
+        'hedge_max_notional_usd': 2.0,
     },
+    # Aggressive: higher frequency (lower threshold, looser guards) and
+    # higher risk (15% of equity, capped at $15) (#10, #11).
     'aggressive': {
-        'threshold': 0.70,
-        'stake_usd': 5.0,
+        'threshold': 0.65,
         'stop_loss_pct': 0.30,
         'exit_before_sec': 20,
         'min_entry_seconds_left': 60,
         'entry_timeout_min': 60,
         'poll_sec': 5.0,
-        'max_spread': 0.03,
-        'min_top_ask_notional_usd': 30.0,
-        'max_quote_age_sec': 8.0,
+        'max_spread': 0.05,
+        'min_top_ask_notional_usd': 20.0,
+        'max_quote_age_sec': 12.0,
         'max_consecutive_errors': 3,
         'max_trades_per_day': 20,
         'daily_max_loss_pct': 15.0,
         'equity_usd': 100.0,
+        'risk_per_trade_pct': 15.0,
+        'max_notional_usd': 15.0,
+        'hedge_enabled': True,
+        'hedge_trigger_price': 0.93,
+        'hedge_trigger_seconds_left': 50,
+        'hedge_share_pct': 5.0,
+        'hedge_min_notional_usd': 1.0,
+        'hedge_max_notional_usd': 3.0,
     },
 }
 
@@ -488,7 +699,6 @@ def _apply_profile_value(args: argparse.Namespace, name: str, cast) -> argparse.
 def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
     for name, cast in (
         ('threshold', float),
-        ('stake_usd', float),
         ('stop_loss_pct', float),
         ('exit_before_sec', int),
         ('min_entry_seconds_left', int),
@@ -501,9 +711,164 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
         ('max_trades_per_day', int),
         ('daily_max_loss_pct', float),
         ('equity_usd', float),
+        ('risk_per_trade_pct', float),
+        ('max_notional_usd', float),
+        ('hedge_trigger_price', float),
+        ('hedge_trigger_seconds_left', int),
+        ('hedge_share_pct', float),
+        ('hedge_min_notional_usd', float),
+        ('hedge_max_notional_usd', float),
     ):
         _apply_profile_value(args, name, cast)
+    # NOTE: stake_usd is intentionally NOT profile-filled. It is an
+    # explicit override only; when unset, resolve_stake_usd() derives the
+    # stake from equity x risk_per_trade_pct capped at max_notional_usd.
+    # hedge_enabled is also NOT profile-filled: profiles both default it
+    # True, and only an explicit --disable-hedge turns it off.
     return args
+
+
+# Minimum order size on Polymarket (~$1). Equity-derived stakes are
+# floored here so dust equity still yields a placeable order.
+MIN_STAKE_USD = 1.0
+
+
+def resolve_stake_usd(args: argparse.Namespace) -> tuple[float, str]:
+    """Per-trade stake in USD (#11).
+
+    Explicit ``--stake-usd`` wins ('explicit'). Otherwise the stake is
+    ``equity_usd * risk_per_trade_pct / 100`` capped at
+    ``max_notional_usd`` and floored at ``MIN_STAKE_USD`` ('equity_pct'),
+    so account growth/shrinkage moves sizing automatically.
+    """
+    explicit = getattr(args, 'stake_usd', None)
+    if explicit is not None:
+        try:
+            if float(explicit) > 0:
+                return float(explicit), 'explicit'
+        except (TypeError, ValueError):
+            pass
+    equity = getattr(args, 'equity_usd', None)
+    equity = 100.0 if equity is None else equity
+    pct = getattr(args, 'risk_per_trade_pct', None) or 0.0
+    cap = getattr(args, 'max_notional_usd', None)
+    try:
+        auto = max(0.0, float(equity) * float(pct) / 100.0)
+    except (TypeError, ValueError):
+        auto = 0.0
+    try:
+        if cap is not None and float(cap) > 0:
+            auto = min(auto, float(cap))
+    except (TypeError, ValueError):
+        pass
+    return max(MIN_STAKE_USD, auto), 'equity_pct'
+
+
+# Graceful shutdown (#14). First SIGTERM/SIGINT sets the flag so the entry
+# loop stops looking, the monitor loop breaks out, and the normal close
+# cascade still runs. A second signal forces immediate exit.
+_shutdown_requested = False
+
+
+def request_shutdown(signum, _frame) -> None:
+    global _shutdown_requested
+    if _shutdown_requested:
+        raise SystemExit(128 + int(signum or 15))
+    _shutdown_requested = True
+
+
+def install_signal_handlers() -> None:
+    try:
+        import signal as _signal
+        _signal.signal(_signal.SIGTERM, request_shutdown)
+        _signal.signal(_signal.SIGINT, request_shutdown)
+    except (ValueError, OSError, RuntimeError):
+        # Not the main thread, or signals unavailable (e.g. Windows).
+        pass
+
+
+def force_close_price(
+    best_bid,
+    discount_pct: float = 0.10,
+    max_discount_abs: float = 0.02,
+) -> Optional[float]:
+    """Last-resort exit price (#12).
+
+    The old code always crossed ``best_bid - 0.02``, which at low prices
+    (e.g. a 0.05 bid) is a ~40% haircut. The discount is now proportional
+    (``discount_pct`` of the bid) capped at ``max_discount_abs``, so high
+    prices behave as before (0.70 -> 0.68) while thin-book bids keep most
+    of their value (0.10 -> 0.09, 0.03 -> 0.027). Returns None when the
+    bid is missing/non-positive so the caller can walk its fallback chain.
+    """
+    try:
+        bid = float(best_bid) if best_bid is not None else 0.0
+    except (TypeError, ValueError):
+        return None
+    if bid <= 0:
+        return None
+    try:
+        pct = float(discount_pct)
+    except (TypeError, ValueError):
+        pct = 0.10
+    try:
+        cap = float(max_discount_abs)
+    except (TypeError, ValueError):
+        cap = 0.02
+    discount = min(max(0.0, cap), max(0.0, bid * pct))
+    return max(0.01, min(0.99, bid - discount))
+
+
+def hedge_sizing(
+    main_cost_usdc,
+    share_pct: float = 3.0,
+    min_notional_usdc: float = 1.0,
+    max_notional_usdc: float = 2.0,
+) -> float:
+    """Micro-hedge notional (#13): ``share_pct`` of the main position cost,
+    clamped to [min, max]. Pure function for unit testing."""
+    try:
+        base = max(0.0, float(main_cost_usdc)) * max(0.0, float(share_pct)) / 100.0
+    except (TypeError, ValueError):
+        return 0.0
+    try:
+        lo = max(0.0, float(min_notional_usdc))
+    except (TypeError, ValueError):
+        lo = 0.0
+    try:
+        hi = float(max_notional_usdc)
+    except (TypeError, ValueError):
+        hi = base
+    if hi > 0:
+        base = min(base, hi)
+    return max(lo, base) if base > 0 else 0.0
+
+
+def hedge_triggered(
+    side_bid,
+    seconds_left,
+    trigger_price: float = 0.95,
+    trigger_seconds_left: int = 45,
+    enabled: bool = True,
+    already_placed_or_attempted: bool = False,
+    hedge_token_id=None,
+) -> bool:
+    """Fire-once predicate for the micro-hedge (#13): enabled, not yet
+    attempted, opposite token known, held-side bid at/above trigger with
+    at most ``trigger_seconds_left`` remaining. Pure; unit-tested."""
+    if not enabled or already_placed_or_attempted or not hedge_token_id:
+        return False
+    try:
+        if float(side_bid or 0) < float(trigger_price):
+            return False
+    except (TypeError, ValueError):
+        return False
+    try:
+        if float(seconds_left if seconds_left is not None else 1e9) > float(trigger_seconds_left):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def default_repo_path() -> str:
@@ -525,7 +890,9 @@ def main():
     ap.add_argument('--repo', default=default_repo_path())
     ap.add_argument('--profile', choices=['conservative', 'aggressive'], default='conservative')
     ap.add_argument('--threshold', type=float, default=None)
-    ap.add_argument('--stake-usd', type=float, default=None)
+    ap.add_argument('--stake-usd', type=float, default=None, help='Explicit per-trade stake override. When unset, the stake is derived from equity x --risk-per-trade-pct capped at --max-notional-usd (#11)')
+    ap.add_argument('--risk-per-trade-pct', type=float, default=None, help='Pct of equity risked per trade (default: 8 conservative, 15 aggressive)')
+    ap.add_argument('--max-notional-usd', type=float, default=None, help='Cap on the equity-derived stake (default: 8 conservative, 15 aggressive)')
     ap.add_argument('--stop-loss-pct', type=float, default=None, help='0.30 means -30%% from entry price')
     ap.add_argument('--exit-before-sec', type=int, default=None)
     ap.add_argument('--min-entry-seconds-left', type=int, default=None, help='Do not open if less seconds remain in current 5m slot')
@@ -533,6 +900,14 @@ def main():
     ap.add_argument('--poll-sec', type=float, default=None)
     ap.add_argument('--close-retry-max', type=int, default=18, help='Max close retries when position is not yet visible / not immediately closable')
     ap.add_argument('--close-retry-delay-sec', type=float, default=2.0, help='Delay between close retries')
+    ap.add_argument('--force-close-discount-pct', type=float, default=0.10, help='Last-resort exit discount as a fraction of the best bid, capped by --force-close-max-discount-abs (#12)')
+    ap.add_argument('--force-close-max-discount-abs', type=float, default=0.02, help='Cap (in price points) on the last-resort exit discount (#12)')
+    ap.add_argument('--disable-hedge', action='store_true', help='Do not place the micro-hedge even when its trigger fires (#13)')
+    ap.add_argument('--hedge-trigger-price', type=float, default=None, help='Place the micro-hedge once the held side bid reaches this (default: 0.95 conservative, 0.93 aggressive)')
+    ap.add_argument('--hedge-trigger-seconds-left', type=int, default=None, help='... and at most this many seconds remain (default: 45 conservative, 50 aggressive)')
+    ap.add_argument('--hedge-share-pct', type=float, default=None, help='Hedge notional as pct of main cost (default: 3 conservative, 5 aggressive)')
+    ap.add_argument('--hedge-min-notional-usd', type=float, default=None, help='Floor on hedge notional (default 1.0)')
+    ap.add_argument('--hedge-max-notional-usd', type=float, default=None, help='Cap on hedge notional (default: 2 conservative, 3 aggressive)')
     ap.add_argument('--max-spread', type=float, default=None, help='Skip entry if picked-side spread exceeds this')
     ap.add_argument('--min-top-ask-notional-usd', type=float, default=None, help='Skip entry if picked-side top ask notional (USD) is below this')
     ap.add_argument('--max-quote-age-sec', type=float, default=None, help='Skip entry if CLOB quote age exceeds this')
@@ -548,13 +923,24 @@ def main():
     args = apply_profile(ap.parse_args())
     if args.runtime_dir is None:
         args.runtime_dir = default_runtime_dir()
+    # Per-trade stake: explicit --stake-usd wins, else equity-derived (#11).
+    stake_usd, stake_basis = resolve_stake_usd(args)
+    # Graceful shutdown (#14): SIGTERM/SIGINT finish the run via the close
+    # cascade instead of orphaning the position.
+    install_signal_handlers()
+    # Micro-hedge master switch (#13): profiles default it on; only an
+    # explicit --disable-hedge turns it off.
+    hedge_enabled = not args.disable_hedge
 
     report: dict[str, Any] = {
         'started_at': ts_utc(),
         'params': {
             'profile': args.profile,
             'threshold': args.threshold,
-            'stake_usd': args.stake_usd,
+            'stake_usd': stake_usd,
+            'stake_basis': stake_basis,
+            'risk_per_trade_pct': args.risk_per_trade_pct,
+            'max_notional_usd': args.max_notional_usd,
             'stop_loss_pct': args.stop_loss_pct,
             'exit_before_sec': args.exit_before_sec,
             'min_entry_seconds_left': args.min_entry_seconds_left,
@@ -573,6 +959,14 @@ def main():
             'execute': args.execute,
             'resume': args.resume,
             'wallet_configured': bool(args.wallet_address),
+            'hedge_enabled': hedge_enabled,
+            'hedge_trigger_price': args.hedge_trigger_price,
+            'hedge_trigger_seconds_left': args.hedge_trigger_seconds_left,
+            'hedge_share_pct': args.hedge_share_pct,
+            'hedge_min_notional_usd': args.hedge_min_notional_usd,
+            'hedge_max_notional_usd': args.hedge_max_notional_usd,
+            'force_close_discount_pct': args.force_close_discount_pct,
+            'force_close_max_discount_abs': args.force_close_max_discount_abs,
         },
         'attempts': [],
         'attempts_dropped': 0,
@@ -623,7 +1017,7 @@ def main():
             abort_run('blocked_leftover_position', 'blocked')
             return
 
-    while opened is None and time.time() < deadline:
+    while opened is None and time.time() < deadline and not _shutdown_requested:
         try:
             # Block new entries once the daily loss cap or the
             # max-trades cap is hit (#4, #5). Exits the run: the
@@ -796,8 +1190,9 @@ def main():
                     time.sleep(args.poll_sec)
                     continue
 
-            out, objs = run_open(args.repo, slug, side, args.stake_usd, args.execute,
-                                 args.max_spread, args.min_top_ask_notional_usd)
+            out, objs = run_open(args.repo, slug, side, stake_usd, args.execute,
+                                 args.max_spread, args.min_top_ask_notional_usd,
+                                 args.equity_usd, args.max_notional_usd)
             post = None
             runner = None
             for o in objs:
@@ -820,6 +1215,12 @@ def main():
                     'cost_usdc': cost,
                     'open_order_id': post.get('orderID'),
                     'open_tx': (post.get('transactionsHashes') or [None])[0],
+                    # Micro-hedge bookkeeping (#13): the opposite-side token
+                    # is known at entry; placement happens in the monitor
+                    # loop when hedge_triggered() fires (fire-once).
+                    'hedge_token_id': str(dn_t if side == 'UP' else up_t) if (dn_t if side == 'UP' else up_t) else None,
+                    'hedge_placed': False,
+                    'hedge_attempted': False,
                 }
                 report['open_raw'] = out[-4000:]
                 # Machine-readable outcome for watchers (#29): the watcher
@@ -877,7 +1278,10 @@ def main():
 
     if not opened:
         report['finished_at'] = ts_utc()
-        report['result'] = 'no_entry_timeout'
+        if _shutdown_requested:
+            report['result'] = 'shutdown_before_entry'
+        else:
+            report['result'] = 'no_entry_timeout'
         report['decision'] = 'no_entry'
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
@@ -895,7 +1299,7 @@ def main():
     report['stop_loss_price'] = sl_price
 
     close_reason = None
-    while True:
+    while not _shutdown_requested:
         now = time.time()
         if now >= (end_ts - args.exit_before_sec):
             close_reason = f'time_exit_{args.exit_before_sec}s_before_end'
@@ -915,141 +1319,143 @@ def main():
         if side_px is not None and side_px <= sl_price:
             close_reason = f"stop_loss_{int(args.stop_loss_pct * 100)}pct"
             break
+        # Micro-hedge placement (#13): once the held side looks almost
+        # certain late in the slot, buy a small opposite-side position as
+        # tail-risk insurance. Fire-once per run; placement uses the same
+        # run_open path as the main entry, and any failure only logs.
+        if hedge_triggered(
+            side_px,
+            (end_ts - now) if end_ts else None,
+            trigger_price=args.hedge_trigger_price,
+            trigger_seconds_left=args.hedge_trigger_seconds_left,
+            enabled=hedge_enabled,
+            already_placed_or_attempted=bool(
+                opened.get('hedge_placed') or opened.get('hedge_attempted')),
+            hedge_token_id=opened.get('hedge_token_id'),
+        ):
+            opened['hedge_attempted'] = True
+            hedge_side = 'DOWN' if opened.get('side') == 'UP' else 'UP'
+            hedge_size = hedge_sizing(
+                opened.get('cost_usdc'),
+                share_pct=args.hedge_share_pct,
+                min_notional_usdc=args.hedge_min_notional_usd,
+                max_notional_usdc=args.hedge_max_notional_usd)
+            try:
+                _hout, _hobjs = run_open(
+                    args.repo, opened['market_slug'], hedge_side, hedge_size,
+                    args.execute, args.max_spread,
+                    args.min_top_ask_notional_usd,
+                    args.equity_usd, args.max_notional_usd)
+                _hpost = None
+                _hrunner = None
+                for _ho in _hobjs:
+                    if isinstance(_ho, dict) and 'order_post_result' in _ho:
+                        _hrunner = _ho
+                        _hpost = _ho.get('order_post_result') or {}
+                if (_hpost and _hpost.get('success') is True
+                        and str(_hpost.get('status', '')).lower() == 'matched'):
+                    opened['hedge_placed'] = True
+                    opened['hedge'] = {
+                        'side': hedge_side,
+                        'token_id': str((_hrunner or {}).get('token_id')
+                                        or opened.get('hedge_token_id')),
+                        'entry_price': float(
+                            (_hrunner or {}).get('entry_price') or 0) or None,
+                        'shares': float(_hpost.get('takingAmount') or 0),
+                        'cost_usdc': float(_hpost.get('makingAmount') or 0),
+                        'open_order_id': _hpost.get('orderID'),
+                    }
+                    log_attempt(report, {'ts': ts_utc(), 'status': 'hedge_placed',
+                                         'side': hedge_side,
+                                         'notional': hedge_size})
+                    try:
+                        alerts.emit(args.runtime_dir, 'hedge',
+                                    {'side': hedge_side,
+                                     'notional': hedge_size,
+                                     'hedge': opened['hedge']},
+                                    args.alert_webhook_url)
+                    except Exception:
+                        pass
+                    try:
+                        save_open_position(args.runtime_dir, opened)
+                    except Exception as e:
+                        report['position_state_warn'] = str(e)
+                else:
+                    log_attempt(report, {'ts': ts_utc(),
+                                         'status': 'hedge_failed',
+                                         'raw': _hout[-2000:]})
+            except Exception as e:
+                log_attempt(report, {'ts': ts_utc(), 'status': 'hedge_error',
+                                     'error': str(e)})
         time.sleep(args.poll_sec)
 
-    close_debug: list[dict[str, Any]] = []
-    close_obj: dict[str, Any] = {}
-    out = ''
-    fallback_used = None
-    force_close_used = None
-    client = auth_clob_client()
+    # SIGTERM/SIGINT during monitoring still runs the close cascade below
+    # with this reason (#14) instead of orphaning the position.
+    if close_reason is None:
+        close_reason = 'shutdown'
 
-    for i in range(max(1, int(args.close_retry_max))):
-        out, objs = run_close(
+    # Shared exit cascade (FAK -> GTC -> poll/cancel/force). The same
+    # function closes the micro-hedge leg below.
+    close_obj, out, close_debug, fallback_used, force_close_used = close_position(
+        args.repo,
+        opened['market_slug'],
+        opened['side'],
+        opened['token_id'],
+        opened['shares'],
+        args.execute,
+        close_retry_max=args.close_retry_max,
+        close_retry_delay_sec=args.close_retry_delay_sec,
+        force_discount_pct=args.force_close_discount_pct,
+        force_max_discount_abs=args.force_close_max_discount_abs,
+        last_side_price=report.get('last_side_price'),
+        entry_price=opened.get('entry_price'),
+        label='main',
+    )
+
+    # Micro-hedge close leg (#13): the hedge is exited through the same
+    # cascade, and its economics fold into the combined PnL below.
+    hedge_closed = None
+    hedge_close_usdc = 0.0
+    hedge_cost_usdc = 0.0
+    if opened.get('hedge_placed') and isinstance(opened.get('hedge'), dict):
+        _h = opened['hedge']
+        hedge_cost_usdc = float(_h.get('cost_usdc') or 0)
+        (_h_close_obj, _h_out, _h_debug, _h_fallback,
+         _h_force) = close_position(
             args.repo,
             opened['market_slug'],
-            opened['token_id'],
-            opened['shares'],
+            str(_h.get('side') or ''),
+            str(_h.get('token_id') or ''),
+            float(_h.get('shares') or 0),
             args.execute,
-            close_order_type='FAK',
+            close_retry_max=args.close_retry_max,
+            close_retry_delay_sec=args.close_retry_delay_sec,
+            force_discount_pct=args.force_close_discount_pct,
+            force_max_discount_abs=args.force_close_max_discount_abs,
+            last_side_price=None,
+            entry_price=_h.get('entry_price'),
+            label='hedge',
         )
-        close_obj = objs[-1] if objs else {}
-        post = close_obj.get('order_post_result') or {}
-        status = str(post.get('status') or '').lower()
-        skipped = str(close_obj.get('close_skipped') or '')
-        close_debug.append({
-            'ts': ts_utc(),
-            'attempt': i + 1,
-            'order_type': 'FAK',
-            'status': status,
-            'close_skipped': skipped,
-        })
-        if post.get('success') is True and status == 'matched':
-            break
-
-        # common transient path right after open: token balance not yet visible
-        if skipped == 'zero_effective_shares':
-            time.sleep(float(args.close_retry_delay_sec))
-            continue
-
-        # fallback: if FAK has no instant match, try a GTC limit close near current side price
-        txt = ((out or '') + '\n' + json.dumps(close_obj, ensure_ascii=False)).lower()
-        if 'no orders found to match with fak order' in txt:
-            bb = None
-            try:
-                bb = clob_best_bid(opened['token_id'])
-            except Exception:
-                bb = None
-            # Prefer the executable bid; fall back to Gamma mid, then the
-            # last monitored price, then the entry price.
-            px = bb
-            if px is None:
-                px = get_side_price_from_slug(opened['market_slug'], opened['side'])
-            if px is None:
-                px = report.get('last_side_price')
-            if px is None:
-                px = opened['entry_price']
-            limit_px = max(0.01, min(0.99, float(px - 0.01)))
-            fallback_used = {'type': 'GTC_LIMIT', 'price': limit_px}
-            out2, objs2 = run_close(
-                args.repo,
-                opened['market_slug'],
-                opened['token_id'],
-                opened['shares'],
-                args.execute,
-                close_order_type='GTC',
-                close_limit_price=limit_px,
-            )
-            close_obj2 = objs2[-1] if objs2 else {}
-            post2 = close_obj2.get('order_post_result') or {}
-            status2 = str(post2.get('status') or '').lower()
-            close_debug.append({
-                'ts': ts_utc(),
-                'attempt': i + 1,
-                'order_type': 'GTC',
-                'status': status2,
-                'close_skipped': str(close_obj2.get('close_skipped') or ''),
-                'limit_price': limit_px,
-            })
-            close_obj = close_obj2
-            out = out2
-            if post2.get('success') is True and status2 == 'matched':
-                break
-
-            # If GTC is accepted but still live, force-close flow: poll status, cancel, repost aggressive.
-            if post2.get('success') is True and status2 == 'live':
-                oid2 = str(post2.get('orderID') or '')
-                st_upd, ord_upd = poll_order_status(client, oid2, wait_sec=min(8.0, max(2.0, float(args.close_retry_delay_sec) * 2)), step_sec=1.0)
-                close_debug.append({
-                    'ts': ts_utc(),
-                    'attempt': i + 1,
-                    'order_type': 'GTC_POLL',
-                    'status': st_upd.lower() if st_upd else '',
-                    'order_id': oid2,
-                })
-                if st_upd == 'MATCHED':
-                    post2['status'] = 'matched'
-                    close_obj['order_post_result'] = post2
-                    break
-
-                cancel_info = cancel_token_orders(client, opened['token_id'])
-                bb2 = None
-                try:
-                    bb2 = clob_best_bid(opened['token_id'])
-                except Exception:
-                    bb2 = None
-                force_px = max(0.01, min(0.99, float((bb2 - 0.02) if bb2 is not None else 0.01)))
-                force_close_used = {
-                    'type': 'FORCE_GTC_LIMIT',
-                    'price': force_px,
-                    'cancel_info': cancel_info,
-                }
-                out3, objs3 = run_close(
-                    args.repo,
-                    opened['market_slug'],
-                    opened['token_id'],
-                    opened['shares'],
-                    args.execute,
-                    close_order_type='GTC',
-                    close_limit_price=force_px,
-                )
-                close_obj3 = objs3[-1] if objs3 else {}
-                post3 = close_obj3.get('order_post_result') or {}
-                status3 = str(post3.get('status') or '').lower()
-                close_debug.append({
-                    'ts': ts_utc(),
-                    'attempt': i + 1,
-                    'order_type': 'FORCE_GTC',
-                    'status': status3,
-                    'close_skipped': str(close_obj3.get('close_skipped') or ''),
-                    'limit_price': force_px,
-                })
-                close_obj = close_obj3
-                out = out3
-                if post3.get('success') is True and status3 == 'matched':
-                    break
-
-        time.sleep(float(args.close_retry_delay_sec))
+        close_debug.extend(_h_debug)
+        _h_post = _h_close_obj.get('order_post_result') or {}
+        _h_status = str(_h_post.get('status') or '').lower()
+        hedge_close_usdc = float(_h_post.get('takingAmount') or 0)
+        hedge_closed = {
+            'close_success': bool(
+                _h_post.get('success') is True
+                and (_h_status == 'matched' or hedge_close_usdc > 0)),
+            'close_status': _h_post.get('status'),
+            'close_order_id': _h_post.get('orderID'),
+            'close_tx': (_h_post.get('transactionsHashes') or [None])[0],
+            'close_shares': float(_h_post.get('makingAmount') or 0),
+            'close_usdc': hedge_close_usdc,
+            'close_skipped': _h_close_obj.get('close_skipped'),
+        }
+        report['hedge_closed'] = hedge_closed
+        if _h_fallback:
+            report['hedge_close_fallback'] = _h_fallback
+        if _h_force:
+            report['hedge_close_force'] = _h_force
 
     post = close_obj.get('order_post_result') or {}
     post_status = str(post.get('status') or '').lower()
@@ -1075,8 +1481,13 @@ def main():
 
     pnl = None
     if closed['close_usdc']:
-        pnl = round(closed['close_usdc'] - opened['cost_usdc'], 6)
+        # Combined economics (#13): main proceeds + hedge proceeds minus
+        # both notionals. Without a hedge leg the extra terms are zero.
+        pnl = round(closed['close_usdc'] + hedge_close_usdc
+                    - opened['cost_usdc'] - hedge_cost_usdc, 6)
     report['realized_cashflow_pnl_usdc'] = pnl
+    report['hedge_pnl_usdc'] = (round(hedge_close_usdc - hedge_cost_usdc, 6)
+                                if hedge_closed else None)
     if ledger_file is not None:
         _ledger = load_ledger(ledger_file, utc_today())
         record_close(_ledger, pnl)
@@ -1108,11 +1519,13 @@ def main():
                     {'close_reason': close_reason,
                      'close_success': closed.get('close_success'),
                      'close_usdc': close_usdc, 'pnl_usdc': pnl,
+                     'hedge_placed': bool(opened.get('hedge_placed')),
+                     'hedge_close_usdc': hedge_close_usdc,
+                     'hedge_pnl_usdc': report.get('hedge_pnl_usdc'),
                      'btc_exit_usd': btc_exit},
                     args.alert_webhook_url)
     except Exception:
         pass
-    report['finished_at'] = ts_utc()
     report['finished_at'] = ts_utc()
     report['result'] = 'done'
 
