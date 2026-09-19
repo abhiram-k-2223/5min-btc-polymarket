@@ -14,6 +14,27 @@ from py_clob_client.client import ClobClient
 from py_clob_client.constants import POLYGON
 from py_clob_client.clob_types import ApiCreds
 
+from btc5m_guards import (
+    can_open,
+    clear_open_position,
+    error_budget_exceeded,
+    ledger_path,
+    liquidity_gate,
+    load_ledger,
+    load_open_position,
+    position_in_tokens,
+    record_close,
+    record_open,
+    save_ledger,
+    save_open_position,
+    spread_gate,
+    staleness_gate,
+    utc_today,
+)
+
+import btc5m_alerts as alerts
+import btc5m_tradedb as tradedb
+
 UTC = dt.timezone.utc
 
 
@@ -23,6 +44,65 @@ def now_utc() -> dt.datetime:
 
 def ts_utc() -> str:
     return now_utc().isoformat().replace('+00:00', 'Z')
+
+
+# Cap for the in-report attempts array (#34). Heartbeat entries are the
+# noisiest, so the oldest heartbeats are dropped first; every drop is
+# counted in report['attempts_dropped'] so nothing is silently lost.
+ATTEMPT_CAP = 1000
+
+
+def log_attempt(report: dict[str, Any], entry: dict[str, Any]) -> None:
+    report['attempts'].append(entry)  # direct list op: this IS the append path
+    if len(report['attempts']) > ATTEMPT_CAP:
+        for i, a in enumerate(report['attempts']):
+            if isinstance(a, dict) and a.get('status') == 'heartbeat':
+                del report['attempts'][i]
+                break
+        else:
+            del report['attempts'][0]
+        report['attempts_dropped'] = report.get('attempts_dropped', 0) + 1
+
+
+def btc_spot_usd(timeout: float = 8.0) -> Optional[float]:
+    """Spot BTC/USD for trade context (#26). Binance first, Coinbase
+    fallback. Best-effort: returns None on any failure, never raises."""
+    sources = [
+        ('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT',
+         lambda j: (j or {}).get('price')),
+        ('https://api.coinbase.com/v2/prices/BTC-USD/spot',
+         lambda j: ((j or {}).get('data') or {}).get('amount')),
+    ]
+    for url, pick in sources:
+        try:
+            r = requests.get(url, timeout=timeout)
+            if r.status_code != 200:
+                continue
+            px = _fnum(pick(r.json()))
+            if px is not None and px > 0:
+                return px
+        except Exception:
+            continue
+    return None
+
+
+DATA_API_POSITIONS_URL = 'https://data-api.polymarket.com/positions'
+
+
+def wallet_positions(wallet: str, timeout: float = 10.0) -> list:
+    """Positions for a wallet via the public data-api (#33, pre-entry
+    duplicate check). py-clob-client exposes no holdings query, so this
+    unauthenticated endpoint is used. Returns a list (possibly empty);
+    never raises — callers treat failure as 'unknown' and fail open."""
+    try:
+        r = requests.get(DATA_API_POSITIONS_URL, params={'user': wallet},
+                         timeout=timeout)
+        if r.status_code != 200:
+            return []
+        obj = r.json()
+        return obj if isinstance(obj, list) else []
+    except Exception:
+        return []
 
 
 def parse_json_objects(text: str) -> list[dict[str, Any]]:
@@ -124,45 +204,108 @@ def market_side_prices(market: dict[str, Any]) -> tuple[float, float, str, str, 
     return up_p, dn_p, up_t, dn_t, str(market.get('slug') or market.get('_event_slug') or ''), str(market.get('endDate') or market.get('endDateIso') or '')
 
 
-def _best_bid_ask(book) -> tuple[Optional[float], Optional[float]]:
+def _fnum(v, default=None):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return default
+    if f != f:  # NaN guard
+        return default
+    return f
+
+
+def _top_of_book(book) -> tuple[Optional[float], float, Optional[float], float]:
+    """Return (best_bid, bid_size, best_ask, ask_size). Sizes default to 0.0."""
     bids = getattr(book, 'bids', []) or []
     asks = getattr(book, 'asks', []) or []
-    best_bid = None
-    best_ask = None
+    best_bid, bid_size, best_ask, ask_size = None, 0.0, None, 0.0
     for b in bids:
-        p = float(getattr(b, 'price', 0) or 0)
+        p = _fnum(getattr(b, 'price', None))
+        if p is None:
+            continue
         if best_bid is None or p > best_bid:
             best_bid = p
+            bid_size = _fnum(getattr(b, 'size', None), 0.0) or 0.0
     for a in asks:
-        p = float(getattr(a, 'price', 0) or 0)
+        p = _fnum(getattr(a, 'price', None))
+        if p is None:
+            continue
         if best_ask is None or p < best_ask:
             best_ask = p
-    return best_bid, best_ask
+            ask_size = _fnum(getattr(a, 'size', None), 0.0) or 0.0
+    return best_bid, bid_size, best_ask, ask_size
 
 
-def clob_side_prices(up_token: str, down_token: str, clob_base: str = 'https://clob.polymarket.com') -> tuple[Optional[float], Optional[float], Optional[float]]:
-    """Return trigger prices from CLOB orderbooks: UP ask, DOWN ask, spread of picked side when available."""
+def _book_timestamp_age_sec(book) -> Optional[float]:
+    """Best-effort quote age from the CLOB book timestamp.
+
+    The CLOB book carries a millisecond-epoch ``timestamp``. If it is
+    missing or unparseable, return None (caller falls back to fetch
+    latency and flags the age as unknown rather than blocking).
+    """
+    ts = getattr(book, 'timestamp', None)
+    if ts is None:
+        return None
+    try:
+        v = float(ts)
+    except (TypeError, ValueError):
+        try:
+            dtv = dt.datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
+            v = dtv.timestamp()
+        except Exception:
+            return None
+    else:
+        if v > 1e12:  # ms epoch
+            v = v / 1000.0
+        elif v > 1e9:  # s epoch
+            pass
+        else:
+            return None
+    return max(0.0, time.time() - v)
+
+
+def clob_side_prices(up_token: str, down_token: str, clob_base: str = 'https://clob.polymarket.com') -> dict[str, Any]:
+    """Return a top-of-book snapshot for both sides.
+
+    Keys: up_ask, up_ask_size, up_bid, dn_ask, dn_ask_size, dn_bid,
+    up_spread, dn_spread, quote_age_sec, fetch_sec.
+    ``quote_age_sec`` is the older of the two book timestamps when
+    available, else the fetch latency (flagged as unknown by callers).
+    Sizes are in shares; multiply by price for USD notional.
+    """
     pub = ClobClient(host=clob_base, chain_id=POLYGON)
+    t0 = time.time()
     up_book = pub.get_order_book(str(up_token))
     dn_book = pub.get_order_book(str(down_token))
-    up_bid, up_ask = _best_bid_ask(up_book)
-    dn_bid, dn_ask = _best_bid_ask(dn_book)
+    fetch_sec = max(0.0, time.time() - t0)
+    up_bid, _up_bid_sz, up_ask, up_ask_sz = _top_of_book(up_book)
+    dn_bid, _dn_bid_sz, dn_ask, dn_ask_sz = _top_of_book(dn_book)
 
-    picked_spread = None
-    # Side picked later by max ask; keep a generic sanity spread estimate
-    if up_ask is not None and up_bid is not None:
-        picked_spread = max(0.0, up_ask - up_bid)
-    if dn_ask is not None and dn_bid is not None:
-        s = max(0.0, dn_ask - dn_bid)
-        picked_spread = s if picked_spread is None else min(picked_spread, s)
+    up_spread = (up_ask - up_bid) if (up_ask is not None and up_bid is not None) else None
+    dn_spread = (dn_ask - dn_bid) if (dn_ask is not None and dn_bid is not None) else None
 
-    return up_ask, dn_ask, picked_spread
+    ages = [a for a in (_book_timestamp_age_sec(up_book), _book_timestamp_age_sec(dn_book)) if a is not None]
+    quote_age = max(ages) if ages else None
+
+    return {
+        'up_ask': up_ask,
+        'up_ask_size': up_ask_sz,
+        'up_bid': up_bid,
+        'dn_ask': dn_ask,
+        'dn_ask_size': dn_ask_sz,
+        'dn_bid': dn_bid,
+        'up_spread': max(0.0, up_spread) if up_spread is not None else None,
+        'dn_spread': max(0.0, dn_spread) if dn_spread is not None else None,
+        'quote_age_sec': quote_age if quote_age is not None else fetch_sec,
+        'quote_age_known': bool(ages),
+        'fetch_sec': fetch_sec,
+    }
 
 
 def clob_best_bid(token_id: str, clob_base: str = 'https://clob.polymarket.com') -> Optional[float]:
     pub = ClobClient(host=clob_base, chain_id=POLYGON)
     book = pub.get_order_book(str(token_id))
-    best_bid, _ = _best_bid_ask(book)
+    best_bid, _, _, _ = _top_of_book(book)
     return best_bid
 
 
@@ -219,7 +362,15 @@ def cancel_token_orders(client: Optional[ClobClient], token_id: str) -> Optional
         return {'error': str(e)}
 
 
-def run_open(repo: str, slug: str, side: str, stake: float, execute: bool) -> tuple[str, list[dict[str, Any]]]:
+def run_open(
+    repo: str,
+    slug: str,
+    side: str,
+    stake: float,
+    execute: bool,
+    max_spread: float | None = None,
+    min_top_ask_notional_usd: float | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     cmd = [
         '.venv/bin/python',
         'src/live/pm_live_trade_runner.py',
@@ -232,8 +383,16 @@ def run_open(repo: str, slug: str, side: str, stake: float, execute: bool) -> tu
     if execute:
         cmd.append('--execute')
     env = os.environ.copy()
-    env.setdefault('PM_MAX_SPREAD', '1')
-    env.setdefault('PM_MIN_TOP_ASK_NOTIONAL_USD', '0')
+    # Propagate this skill's spread/liquidity guards to the external runner
+    # instead of disabling them (previously hard-coded to 1 and 0).
+    if max_spread is not None:
+        env['PM_MAX_SPREAD'] = str(max_spread)
+    else:
+        env.setdefault('PM_MAX_SPREAD', '1')
+    if min_top_ask_notional_usd is not None:
+        env['PM_MIN_TOP_ASK_NOTIONAL_USD'] = str(min_top_ask_notional_usd)
+    else:
+        env.setdefault('PM_MIN_TOP_ASK_NOTIONAL_USD', '0')
     env.setdefault('PM_ORDER_TYPE', 'FAK')
     p = subprocess.run(cmd, cwd=repo, capture_output=True, text=True, env=env)
     out = (p.stdout or '') + '\n' + (p.stderr or '')
@@ -290,6 +449,15 @@ PROFILES: dict[str, dict[str, Any]] = {
         'min_entry_seconds_left': 60,
         'entry_timeout_min': 60,
         'poll_sec': 5.0,
+        # Pre-entry execution guards (mirror config/btc_5m_profiles.yaml execution_safety).
+        'max_spread': 0.03,
+        'min_top_ask_notional_usd': 30.0,
+        'max_quote_age_sec': 8.0,
+        'max_consecutive_errors': 3,
+        # Session risk ledger (mirror config profiles sizing caps).
+        'max_trades_per_day': 12,
+        'daily_max_loss_pct': 10.0,
+        'equity_usd': 100.0,
     },
     'aggressive': {
         'threshold': 0.70,
@@ -299,26 +467,42 @@ PROFILES: dict[str, dict[str, Any]] = {
         'min_entry_seconds_left': 60,
         'entry_timeout_min': 60,
         'poll_sec': 5.0,
+        'max_spread': 0.03,
+        'min_top_ask_notional_usd': 30.0,
+        'max_quote_age_sec': 8.0,
+        'max_consecutive_errors': 3,
+        'max_trades_per_day': 20,
+        'daily_max_loss_pct': 15.0,
+        'equity_usd': 100.0,
     },
 }
 
 
+def _apply_profile_value(args: argparse.Namespace, name: str, cast) -> argparse.Namespace:
+    if getattr(args, name, None) is None:
+        prof = PROFILES.get(args.profile or 'conservative', PROFILES['conservative'])
+        setattr(args, name, cast(prof[name]))
+    return args
+
+
 def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
-    prof = PROFILES.get(args.profile or 'conservative', PROFILES['conservative'])
-    if args.threshold is None:
-        args.threshold = float(prof['threshold'])
-    if args.stake_usd is None:
-        args.stake_usd = float(prof['stake_usd'])
-    if args.stop_loss_pct is None:
-        args.stop_loss_pct = float(prof['stop_loss_pct'])
-    if args.exit_before_sec is None:
-        args.exit_before_sec = int(prof['exit_before_sec'])
-    if args.min_entry_seconds_left is None:
-        args.min_entry_seconds_left = int(prof['min_entry_seconds_left'])
-    if args.entry_timeout_min is None:
-        args.entry_timeout_min = int(prof['entry_timeout_min'])
-    if args.poll_sec is None:
-        args.poll_sec = float(prof['poll_sec'])
+    for name, cast in (
+        ('threshold', float),
+        ('stake_usd', float),
+        ('stop_loss_pct', float),
+        ('exit_before_sec', int),
+        ('min_entry_seconds_left', int),
+        ('entry_timeout_min', int),
+        ('poll_sec', float),
+        ('max_spread', float),
+        ('min_top_ask_notional_usd', float),
+        ('max_quote_age_sec', float),
+        ('max_consecutive_errors', int),
+        ('max_trades_per_day', int),
+        ('daily_max_loss_pct', float),
+        ('equity_usd', float),
+    ):
+        _apply_profile_value(args, name, cast)
     return args
 
 
@@ -327,6 +511,13 @@ def default_repo_path() -> str:
     if env_repo:
         return env_repo
     return str(Path(__file__).resolve().parents[3] / 'pm-hl-conservative-plus-repo')
+
+
+def default_runtime_dir() -> str:
+    env_dir = os.environ.get('BTC5M_RUNTIME_DIR')
+    if env_dir:
+        return env_dir
+    return str(Path(__file__).resolve().parents[1] / 'runtime')
 
 
 def main():
@@ -342,8 +533,21 @@ def main():
     ap.add_argument('--poll-sec', type=float, default=None)
     ap.add_argument('--close-retry-max', type=int, default=18, help='Max close retries when position is not yet visible / not immediately closable')
     ap.add_argument('--close-retry-delay-sec', type=float, default=2.0, help='Delay between close retries')
+    ap.add_argument('--max-spread', type=float, default=None, help='Skip entry if picked-side spread exceeds this')
+    ap.add_argument('--min-top-ask-notional-usd', type=float, default=None, help='Skip entry if picked-side top ask notional (USD) is below this')
+    ap.add_argument('--max-quote-age-sec', type=float, default=None, help='Skip entry if CLOB quote age exceeds this')
+    ap.add_argument('--max-consecutive-errors', type=int, default=None, help='Abort run after this many consecutive API/execution errors')
+    ap.add_argument('--max-trades-per-day', type=int, default=None, help='Block new entries after this many live trades today (UTC)')
+    ap.add_argument('--daily-max-loss-pct', type=float, default=None, help='Block new entries after losing this pct of equity today (UTC)')
+    ap.add_argument('--equity-usd', type=float, default=None, help='Account equity reference for the daily-loss cap')
+    ap.add_argument('--runtime-dir', default=None, help='Runtime dir holding logs and the risk ledger (default: <skill>/runtime)')
+    ap.add_argument('--resume', action='store_true', help='Resume a leftover open position from a crashed run instead of opening a new one (#33)')
+    ap.add_argument('--wallet-address', default=os.environ.get('BTC5M_WALLET_ADDRESS') or os.environ.get('POLY_WALLET_ADDRESS'), help='Wallet for the pre-entry duplicate-position check (#33)')
+    ap.add_argument('--alert-webhook-url', default=None, help='Optional webhook URL for entry/close/abort alerts; falls back to BTC5M_ALERT_WEBHOOK env (#27)')
     ap.add_argument('--execute', action='store_true')
     args = apply_profile(ap.parse_args())
+    if args.runtime_dir is None:
+        args.runtime_dir = default_runtime_dir()
 
     report: dict[str, Any] = {
         'started_at': ts_utc(),
@@ -358,19 +562,89 @@ def main():
             'poll_sec': args.poll_sec,
             'close_retry_max': args.close_retry_max,
             'close_retry_delay_sec': args.close_retry_delay_sec,
+            'max_spread': args.max_spread,
+            'min_top_ask_notional_usd': args.min_top_ask_notional_usd,
+            'max_quote_age_sec': args.max_quote_age_sec,
+            'max_consecutive_errors': args.max_consecutive_errors,
+            'max_trades_per_day': args.max_trades_per_day,
+            'daily_max_loss_pct': args.daily_max_loss_pct,
+            'equity_usd': args.equity_usd,
+            'runtime_dir': args.runtime_dir,
             'execute': args.execute,
+            'resume': args.resume,
+            'wallet_configured': bool(args.wallet_address),
         },
         'attempts': [],
+        'attempts_dropped': 0,
     }
 
     deadline = time.time() + args.entry_timeout_min * 60
     opened = None
+    err_streak = 0
+    # Session risk ledger (#4, #5): live trades only; dry-runs neither
+    # consume the daily budget nor enforce it.
+    ledger_file = ledger_path(args.runtime_dir) if args.execute else None
 
-    while time.time() < deadline:
+    def abort_run(result: str, decision: str):
+        report['finished_at'] = ts_utc()
+        report['result'] = result
+        report['decision'] = decision
+        report['consecutive_errors'] = err_streak
         try:
+            alerts.emit(args.runtime_dir,
+                        'blocked' if decision == 'blocked' else 'aborted',
+                        {'result': result}, args.alert_webhook_url)
+        except Exception:
+            pass
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+
+    # Crash recovery (#33): a leftover open_position.json means the previous
+    # process died mid-position. With --resume, monitor that position instead
+    # of opening a new one; without it, refuse to run so we never double in.
+    leftover = load_open_position(args.runtime_dir)
+    if leftover is not None:
+        if args.resume:
+            opened = dict(leftover)
+            report['resumed'] = True
+            try:
+                alerts.emit(args.runtime_dir, 'resumed',
+                            {'side': opened.get('side'),
+                             'market_slug': opened.get('market_slug')},
+                            args.alert_webhook_url)
+            except Exception:
+                pass
+            log_attempt(report, {'ts': ts_utc(), 'status': 'resumed_position',
+                                 'side': opened.get('side'),
+                                 'slug': opened.get('market_slug')})
+        else:
+            log_attempt(report, {'ts': ts_utc(), 'status': 'blocked_leftover_position',
+                                 'position': {k: leftover.get(k) for k in
+                                              ('side', 'market_slug', 'token_id')}})
+            abort_run('blocked_leftover_position', 'blocked')
+            return
+
+    while opened is None and time.time() < deadline:
+        try:
+            # Block new entries once the daily loss cap or the
+            # max-trades cap is hit (#4, #5). Exits the run: the
+            # session is done for the day.
+            if ledger_file is not None:
+                _ledger = load_ledger(ledger_file, utc_today())
+                _allowed, _reason = can_open(
+                    _ledger,
+                    max_trades_per_day=args.max_trades_per_day,
+                    daily_max_loss_pct=args.daily_max_loss_pct,
+                    equity_usd=args.equity_usd,
+                )
+                if not _allowed:
+                    log_attempt(report, {'ts': ts_utc(), 'status': 'blocked_daily_limits', 'reason': _reason})
+                    abort_run('blocked_' + _reason, 'blocked')
+                    return
+
             m = resolve_active_current_5m_market()
             if not m:
-                report['attempts'].append({'ts': ts_utc(), 'status': 'heartbeat_no_current_market'})
+                log_attempt(report, {'ts': ts_utc(), 'status': 'heartbeat_no_current_market'})
+                err_streak = 0
                 time.sleep(args.poll_sec)
                 continue
 
@@ -385,31 +659,42 @@ def main():
                 pass
 
             if sec_left is None:
-                report['attempts'].append({'ts': ts_utc(), 'slug': slug, 'status': 'heartbeat_bad_market_end'})
+                log_attempt(report, {'ts': ts_utc(), 'slug': slug, 'status': 'heartbeat_bad_market_end'})
+                err_streak = 0
                 time.sleep(args.poll_sec)
                 continue
 
             # Do not open if less than N seconds remain in current slot.
             if sec_left < args.min_entry_seconds_left:
-                report['attempts'].append({
+                log_attempt(report, {
                     'ts': ts_utc(),
                     'slug': slug,
                     'status': 'skip_too_late_to_enter',
                     'seconds_left': sec_left,
                     'min_entry_seconds_left': args.min_entry_seconds_left,
                 })
+                err_streak = 0
                 time.sleep(args.poll_sec)
                 continue
 
             # CLOB-based trigger price (best ask of selected side), not Gamma outcomePrices.
             try:
-                up_ask, dn_ask, min_spread = clob_side_prices(up_t, dn_t)
+                snap = clob_side_prices(up_t, dn_t)
             except Exception as e:
-                report['attempts'].append({'ts': ts_utc(), 'slug': slug, 'status': 'skip_clob_unavailable', 'error': str(e)})
+                log_attempt(report, {'ts': ts_utc(), 'slug': slug, 'status': 'skip_clob_unavailable', 'error': str(e)})
+                err_streak += 1
+                if error_budget_exceeded(err_streak, args.max_consecutive_errors):
+                    abort_run('aborted_consecutive_errors', 'aborted')
+                    return
                 time.sleep(args.poll_sec)
                 continue
 
-            report['attempts'].append({
+            up_ask = snap['up_ask']
+            dn_ask = snap['dn_ask']
+            spreads = [s for s in (snap['up_spread'], snap['dn_spread']) if s is not None]
+            min_spread = min(spreads) if spreads else None
+
+            log_attempt(report, {
                 'ts': ts_utc(),
                 'slug': slug,
                 'status': 'heartbeat',
@@ -417,8 +702,14 @@ def main():
                 'gamma_down': g_dn,
                 'clob_up_ask': up_ask,
                 'clob_down_ask': dn_ask,
+                'up_ask_size': snap['up_ask_size'],
+                'dn_ask_size': snap['dn_ask_size'],
+                'up_spread': snap['up_spread'],
+                'dn_spread': snap['dn_spread'],
                 'seconds_left': sec_left,
                 'min_spread': min_spread,
+                'quote_age_sec': snap['quote_age_sec'],
+                'quote_age_known': snap['quote_age_known'],
             })
 
             candidates: list[tuple[str, float]] = []
@@ -428,7 +719,7 @@ def main():
                 candidates.append(('DOWN', float(dn_ask)))
 
             if not candidates:
-                report['attempts'].append({
+                log_attempt(report, {
                     'ts': ts_utc(),
                     'slug': slug,
                     'status': 'skip_price_below_threshold',
@@ -437,12 +728,76 @@ def main():
                     'clob_down_ask': dn_ask,
                     'seconds_left': sec_left,
                 })
+                err_streak = 0
                 time.sleep(args.poll_sec)
                 continue
 
             side, trigger_price = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
 
-            out, objs = run_open(args.repo, slug, side, args.stake_usd, args.execute)
+            # Pre-entry execution guards (#6, #7, #8) on the picked side.
+            snap_side = 'up' if side == 'UP' else 'dn'
+            side_spread = snap[f'{snap_side}_spread']
+            side_ask = snap[f'{snap_side}_ask']
+            side_ask_size = snap[f'{snap_side}_ask_size']
+            side_notional = (side_ask * side_ask_size) if (side_ask is not None) else None
+            side_age = snap['quote_age_sec'] if snap['quote_age_known'] else None
+            gate_checks = [
+                ('skip_spread_guard', spread_gate(side_spread, args.max_spread)),
+                ('skip_liquidity_guard', liquidity_gate(side_notional, args.min_top_ask_notional_usd)),
+                ('skip_stale_quote', staleness_gate(side_age, args.max_quote_age_sec)),
+            ]
+            gate_failed = None
+            for gate_status, (gate_ok, gate_reason) in gate_checks:
+                if not gate_ok:
+                    gate_failed = (gate_status, gate_reason)
+                    break
+            if gate_failed is not None:
+                gate_status, gate_reason = gate_failed
+                log_attempt(report, {
+                    'ts': ts_utc(),
+                    'slug': slug,
+                    'status': gate_status,
+                    'reason': gate_reason,
+                    'side': side,
+                    'side_spread': side_spread,
+                    'side_ask_notional_usd': side_notional,
+                    'quote_age_sec': snap['quote_age_sec'],
+                    'quote_age_known': snap['quote_age_known'],
+                })
+                err_streak = 0
+                time.sleep(args.poll_sec)
+                continue
+
+            # Duplicate-position guard (#33): skip if the wallet already
+            # holds either side's token (e.g. a crashed run's position, or
+            # a manual trade). Lookup failures fail open — a warn is logged
+            # and the entry attempt proceeds.
+            if args.wallet_address:
+                try:
+                    _dup = position_in_tokens(
+                        wallet_positions(args.wallet_address), [up_t, dn_t])
+                except Exception as e:
+                    _dup = None
+                    log_attempt(report, {'ts': ts_utc(), 'slug': slug,
+                                         'status': 'warn_positions_lookup_failed',
+                                         'error': str(e)})
+                if _dup is not None:
+                    log_attempt(report, {'ts': ts_utc(), 'slug': slug,
+                                         'status': 'skip_duplicate_position',
+                                         'side': side,
+                                         'size': _dup.get('size')})
+                    try:
+                        alerts.emit(args.runtime_dir, 'blocked',
+                                    {'reason': 'duplicate_position',
+                                     'side': side}, args.alert_webhook_url)
+                    except Exception:
+                        pass
+                    err_streak = 0
+                    time.sleep(args.poll_sec)
+                    continue
+
+            out, objs = run_open(args.repo, slug, side, args.stake_usd, args.execute,
+                                 args.max_spread, args.min_top_ask_notional_usd)
             post = None
             runner = None
             for o in objs:
@@ -467,16 +822,63 @@ def main():
                     'open_tx': (post.get('transactionsHashes') or [None])[0],
                 }
                 report['open_raw'] = out[-4000:]
+                # Machine-readable outcome for watchers (#29): the watcher
+                # stops its loop on '"decision": "enter"'.
+                report['decision'] = 'enter'
+                err_streak = 0
+                if ledger_file is not None:
+                    _ledger = load_ledger(ledger_file, utc_today())
+                    record_open(_ledger)
+                    if not save_ledger(ledger_file, _ledger):
+                        report['ledger_warn'] = 'save_failed'
+                # Ops hooks (#25 trade DB, #26 BTC context, #27 alert,
+                # #33 crash-recovery state). All best-effort: a failure
+                # here must never undo a filled entry.
+                btc_entry = btc_spot_usd()
+                if btc_entry is not None:
+                    opened['btc_entry_usd'] = btc_entry
+                try:
+                    _con = tradedb.connect(args.runtime_dir)
+                    opened['trade_db_id'] = tradedb.record_open(
+                        _con, mode='live' if args.execute else 'dry',
+                        market_slug=slug, side=side, token_id=token_id,
+                        entry_price=entry_price, shares=shares, cost_usdc=cost,
+                        btc_entry=btc_entry, open_order_id=post.get('orderID'))
+                    _con.close()
+                except Exception as e:
+                    report['tradedb_warn'] = str(e)
+                try:
+                    save_open_position(args.runtime_dir, opened)
+                except Exception as e:
+                    report['position_state_warn'] = str(e)
+                try:
+                    alerts.emit(args.runtime_dir, 'entry',
+                                {'side': side, 'market_slug': slug,
+                                 'entry_price': entry_price, 'shares': shares,
+                                 'cost_usdc': cost, 'btc_entry_usd': btc_entry,
+                                 'execute': bool(args.execute)},
+                                args.alert_webhook_url)
+                except Exception:
+                    pass
                 break
             else:
                 report['last_open_try'] = out[-2000:]
+                err_streak += 1
+                if error_budget_exceeded(err_streak, args.max_consecutive_errors):
+                    abort_run('aborted_consecutive_errors', 'aborted')
+                    return
         except Exception as e:
-            report['attempts'].append({'ts': ts_utc(), 'status': 'error', 'error': str(e)})
+            log_attempt(report, {'ts': ts_utc(), 'status': 'error', 'error': str(e)})
+            err_streak += 1
+            if error_budget_exceeded(err_streak, args.max_consecutive_errors):
+                abort_run('aborted_consecutive_errors', 'aborted')
+                return
         time.sleep(args.poll_sec)
 
     if not opened:
         report['finished_at'] = ts_utc()
         report['result'] = 'no_entry_timeout'
+        report['decision'] = 'no_entry'
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return
 
@@ -499,8 +901,16 @@ def main():
             close_reason = f'time_exit_{args.exit_before_sec}s_before_end'
             break
 
-        side_px = get_side_price_from_slug(opened['market_slug'], opened['side'])
+        # Stop-loss is evaluated against the CLOB best bid of the held
+        # token (#31) — the price an exit can actually fill at — instead
+        # of the Gamma outcomePrices mid. This also avoids a Gamma HTTP
+        # round-trip on every poll (#15, monitor path).
+        try:
+            side_px = clob_best_bid(opened['token_id'])
+        except Exception:
+            side_px = None
         report['last_side_price'] = side_px
+        report['last_side_price_source'] = 'clob_best_bid'
         report['last_check_at'] = ts_utc()
         if side_px is not None and side_px <= sl_price:
             close_reason = f"stop_loss_{int(args.stop_loss_pct * 100)}pct"
@@ -545,17 +955,21 @@ def main():
         # fallback: if FAK has no instant match, try a GTC limit close near current side price
         txt = ((out or '') + '\n' + json.dumps(close_obj, ensure_ascii=False)).lower()
         if 'no orders found to match with fak order' in txt:
-            px = get_side_price_from_slug(opened['market_slug'], opened['side'])
-            if px is None:
-                px = report.get('last_side_price')
-            if px is None:
-                px = opened['entry_price']
             bb = None
             try:
                 bb = clob_best_bid(opened['token_id'])
             except Exception:
                 bb = None
-            limit_px = max(0.01, min(0.99, float((bb - 0.01) if bb is not None else px)))
+            # Prefer the executable bid; fall back to Gamma mid, then the
+            # last monitored price, then the entry price.
+            px = bb
+            if px is None:
+                px = get_side_price_from_slug(opened['market_slug'], opened['side'])
+            if px is None:
+                px = report.get('last_side_price')
+            if px is None:
+                px = opened['entry_price']
+            limit_px = max(0.01, min(0.99, float(px - 0.01)))
             fallback_used = {'type': 'GTC_LIMIT', 'price': limit_px}
             out2, objs2 = run_close(
                 args.repo,
@@ -663,6 +1077,42 @@ def main():
     if closed['close_usdc']:
         pnl = round(closed['close_usdc'] - opened['cost_usdc'], 6)
     report['realized_cashflow_pnl_usdc'] = pnl
+    if ledger_file is not None:
+        _ledger = load_ledger(ledger_file, utc_today())
+        record_close(_ledger, pnl)
+        if not save_ledger(ledger_file, _ledger):
+            report['ledger_warn'] = 'save_failed'
+    # Ops close hooks (#25 trade DB, #26 BTC context, #27 alert,
+    # #33 clear crash-recovery state). Best-effort, like the entry hooks.
+    btc_exit = btc_spot_usd()
+    if btc_exit is not None:
+        closed['btc_exit_usd'] = btc_exit
+    if opened.get('trade_db_id') is not None:
+        try:
+            _con = tradedb.connect(args.runtime_dir)
+            tradedb.record_close(
+                _con, int(opened['trade_db_id']),
+                close_reason=close_reason,
+                close_usdc=close_usdc or None,
+                pnl_usdc=pnl, btc_exit=btc_exit,
+                close_tx=closed.get('close_tx'))
+            _con.close()
+        except Exception as e:
+            report['tradedb_warn'] = str(e)
+    try:
+        clear_open_position(args.runtime_dir)
+    except Exception as e:
+        report['position_state_warn'] = str(e)
+    try:
+        alerts.emit(args.runtime_dir, 'close',
+                    {'close_reason': close_reason,
+                     'close_success': closed.get('close_success'),
+                     'close_usdc': close_usdc, 'pnl_usdc': pnl,
+                     'btc_exit_usd': btc_exit},
+                    args.alert_webhook_url)
+    except Exception:
+        pass
+    report['finished_at'] = ts_utc()
     report['finished_at'] = ts_utc()
     report['result'] = 'done'
 

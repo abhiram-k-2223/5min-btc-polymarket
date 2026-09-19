@@ -1,0 +1,9 @@
+# Runtime dependencies for scripts/test_btc_5m_session_exit_sl.py
+# (everything else in scripts/ is stdlib-only).
+#
+# Install:  python -m venv .venv && .venv/bin/pip install -r requirements.txt
+requests>=2.31
+# Pinned: py-clob-client versions interact with the Polymarket order-version
+# matrix (see problems.md upstream issue i2). Re-evaluate the pin if the
+# SDK releases a fix for the signature_type/order-version deadlock.
+py-clob-client==0.34.6

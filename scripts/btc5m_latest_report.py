@@ -21,11 +21,41 @@ def parse_tail_json(path: str):
     return json.loads(blob)
 
 
+# Maximum age of a .reported marker before it is pruned (#34). Markers for
+# deleted/rotated logs would otherwise accumulate in runtime/ forever.
+MARKER_MAX_AGE_SEC = 7 * 24 * 3600
+
+
+def prune_stale_markers(runtime_dir: str) -> int:
+    """Delete .reported markers older than MARKER_MAX_AGE_SEC. Returns count."""
+    import time
+
+    pruned = 0
+    now = time.time()
+    try:
+        names = os.listdir(runtime_dir)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.endswith(".reported"):
+            continue
+        path = os.path.join(runtime_dir, name)
+        try:
+            if now - os.path.getmtime(path) > MARKER_MAX_AGE_SEC:
+                os.unlink(path)
+                pruned += 1
+        except OSError:
+            continue
+    return pruned
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runtime-dir", default=default_runtime_dir())
     ap.add_argument("--mark", action="store_true")
     args = ap.parse_args()
+
+    prune_stale_markers(args.runtime_dir)
 
     logs = sorted(glob.glob(os.path.join(args.runtime_dir, "btc5m_*.log")), key=os.path.getmtime, reverse=True)
     if not logs:

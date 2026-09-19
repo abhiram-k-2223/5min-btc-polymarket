@@ -4,6 +4,21 @@ Open-source OpenClaw skill for **BTC 5-minute Up/Down** markets on Polymarket.
 
 Repository: https://github.com/Novals83/5min-btc-polymarket
 
+## Recent Fixes
+A repo audit surfaced ~30 execution, risk, and ops gaps; the following are
+now fixed and covered by 48 unit tests (`scripts/tests/`):
+- Daily loss cap + max trades/day enforced via a JSON risk ledger (live trades only)
+- Pre-entry spread / liquidity / quote-staleness gates on the CLOB book
+- Consecutive-error abort, and a machine-readable `decision` field the watcher stops on
+- Stop-loss monitored at the executable CLOB bid (not the Gamma mid)
+- SQLite trade ledger, spot-BTC entry/exit logging, `alerts.log` + webhook alerts
+- Crash recovery (`open_position.json` + `--resume`) and a duplicate-position guard
+- Pendulum-based backtest harness (`scripts/btc5m_backtest.py`), validated on a real market
+- Pinned `requirements.txt`, working Dockerfile/compose, log-hygiene fixes
+
+More problems from the audit are still being worked through — strategy edges,
+order-book depth modeling, and remaining ops items. Contributions welcome.
+
 ## Strategy (Momentum into Close)
 This skill is aligned with a short-horizon momentum strategy:
 
@@ -34,6 +49,8 @@ This is a momentum-following approach, not a reversal strategy.
 ```bash
 git clone https://github.com/Novals83/5min-btc-polymarket.git
 cd 5min-btc-polymarket
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 ```
 
 Read:
@@ -64,12 +81,60 @@ Runtime isolation:
 - overrides: `BTC5M_REPO`, `BTC5M_ENV_FILE`, `BTC5M_RUNNER`
 - completion auto-report cron (topic 184): `btc5m-completion-autoreport-topic184`
 
-Optional Docker isolation:
+Optional Docker isolation (builds `Dockerfile` with pinned deps; default
+`up` runs a conservative **dry-run** session — no orders without `--execute`):
 ```bash
+scripts/btc5m_docker.sh build
 scripts/btc5m_docker.sh up
 scripts/btc5m_docker.sh status
+scripts/btc5m_docker.sh run -- --profile conservative --execute  # live
 scripts/btc5m_docker.sh down
 ```
+Env overrides: `BTC5M_ENV_FILE` (creds), `BTC5M_EXEC_REPO`
+(external execution repo, default `../pm-hl-conservative-plus-repo`),
+`BTC5M_RUNTIME_DIR` (default `./runtime`).
+
+## Ops: Trade DB, Alerts, Recovery, Backtest
+
+Every session (dry or live) writes to a SQLite trade ledger and an alert
+queue inside the runtime dir:
+
+```bash
+python scripts/btc5m_tradedb.py recent --runtime-dir runtime --limit 10
+python scripts/btc5m_tradedb.py summary --runtime-dir runtime --days 7
+python scripts/btc5m_alerts.py --runtime-dir runtime
+```
+
+Entry/close/abort/blocked/resumed events also append to
+`runtime/alerts.log`. Set `BTC5M_ALERT_WEBHOOK` (or
+`--alert-webhook-url`) for a Slack-compatible webhook POST on top.
+Spot BTC/USD at entry and exit is logged from Binance (Coinbase fallback).
+
+Crash recovery: the runner writes `runtime/open_position.json` on entry
+and deletes it on close. A leftover file blocks new runs — unless
+`--resume` is passed, which monitors the recorded position to exit.
+`--wallet-address` (or `BTC5M_WALLET_ADDRESS`) enables a pre-entry
+duplicate-position check via the public data-api; lookup failures fail
+open with a warning.
+
+Backtest the entry/exit logic against real Pendulum orderbook archives
+(no auth needed; hour files are large, fetch one market at a time):
+
+```bash
+# 1. find a past 5m market's token IDs (Gamma, no auth)
+curl -s "https://gamma-api.polymarket.com/events?slug=btc-updown-5m-<ts>" | python3 -c "..."
+# 2. export its book snapshots for the market hour (needs: pip install duckdb)
+python scripts/btc5m_backtest.py fetch --up-token-id <UP> --dn-token-id <DN> \
+  --hour 2026-09-18T19 --out data/backtest/mkt.jsonl
+# 3. replay with runner-equivalent parameters
+python scripts/btc5m_backtest.py replay --snapshots data/backtest/mkt.jsonl \
+  --market-end <unix_ts> --threshold 0.70 --stop-loss-pct 0.30
+```
+
+Tops are derived from the bid/ask ladders (the archive's `best_*`
+columns are null for these hours), and quote age is proxied by the gap
+since the previous same-side snapshot. Positions still open at end of
+data are flagged `end_of_data` and excluded from metrics.
 
 ## Execution Checklist (Before Live Trade)
 Use this quick pre-flight checklist before any real order:

@@ -100,3 +100,5 @@ runner_mapping:
 notes:
   - "Current 5m runner uses threshold/side-strength logic; impulse filter integration can be extended at strategy layer."
   - "Entry behavior: continuous CLOB ask monitoring; if UP/DOWN >= threshold, enter on stronger side."
+  - "Enforced by the runner (scripts/test_btc_5m_session_exit_sl.py + scripts/btc5m_guards.py): picked-side spread gate (skip_if_spread_gt), top-ask notional gate (skip_if_top_ask_notional_usd_lt), quote-age gate (skip_if_quote_stale_sec_gt, best-effort via book timestamp), consecutive-error abort (skip_if_dns_or_api_errors_consecutive), and a UTC-day risk ledger for max_trades_per_day / daily_max_loss_pct (live trades only). Values mirrored in the runner PROFILES dict; all overridable via CLI flags."
+  - "Stop-loss is monitored at the CLOB best bid of the held token (executable price), not the Gamma mid."

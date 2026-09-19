@@ -1,14 +1,23 @@
-version: "3.9"
-
+# BTC 5m runner (#32). Builds the Dockerfile in this repo so the container
+# can actually run the strategy (deps installed, entrypoint = runner).
+#
+# Env names match the README overrides (BTC5M_REPO / BTC5M_ENV_FILE /
+# BTC5M_RUNTIME_DIR); BTC5M_EXEC_REPO points at the external execution repo
+# (pm-hl-conservative-plus-repo) whose .venv runs order open/close.
+#
+# Dry-run session (default CMD, no orders):  docker compose up
+# Live session:  scripts/btc5m_docker.sh run -- --profile conservative --execute
 services:
   btc5m:
-    image: python:3.12-slim
-    working_dir: /workspace
-    command: ["bash", "-lc", "sleep infinity"]
+    build: .
+    image: btc5m:latest
     volumes:
-      - ${WORKSPACE_DIR:-../..}:/workspace
+      - ${BTC5M_RUNTIME_DIR:-./runtime}:/skill/runtime
+      - ${BTC5M_EXEC_REPO:-../pm-hl-conservative-plus-repo}:/exec-repo:ro
     env_file:
-      - ${TRADING_ENV_FILE:-../../pm-hl-conservative-plus-repo/.env}
+      - ${BTC5M_ENV_FILE:-../pm-hl-conservative-plus-repo/.env}
     environment:
       - PYTHONUNBUFFERED=1
-    restart: unless-stopped
+      - BTC5M_REPO=/exec-repo
+      - BTC5M_RUNTIME_DIR=/skill/runtime
+    restart: "no"
