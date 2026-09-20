@@ -416,5 +416,23 @@ class MomentumHelpersTest(unittest.TestCase):
         self.assertEqual(out2.btc_move_usd_min, 70.0)
 
 
+class RepoPathValidationTest(unittest.TestCase):
+    def test_missing_dir_reports_path(self):
+        err = r.repo_path_error("/nonexistent/pm-hl-conservative-plus-repo")
+        assert err is not None
+        self.assertIn("/nonexistent/pm-hl-conservative-plus-repo", err)
+        self.assertIn("--repo", err)
+
+    def test_empty_path_reports(self):
+        for bad in ("", "   ", None):
+            err = r.repo_path_error(bad)
+            assert err is not None
+            self.assertIn("--repo", err)
+
+    def test_existing_dir_passes(self):
+        import tempfile
+        self.assertIsNone(r.repo_path_error(tempfile.mkdtemp()))
+
+
 if __name__ == "__main__":
     unittest.main()

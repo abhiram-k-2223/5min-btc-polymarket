@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE_ROOT="$(cd "$SKILL_ROOT/../.." && pwd)"
 REPO="${BTC5M_REPO:-$WORKSPACE_ROOT/pm-hl-conservative-plus-repo}"
-PY="$SCRIPT_DIR/run_btc_5m_threshold_test.py"  # compatibility wrapper -> canonical runner
+PY="$SCRIPT_DIR/test_btc_5m_session_exit_sl.py"  # canonical runner, called directly (#19)
 LOG="$REPO/runtime/btc_5m_threshold_watch.log"
 STATE="$REPO/runtime/btc_5m_threshold_watch.state"
 

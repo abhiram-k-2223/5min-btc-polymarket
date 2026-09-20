@@ -79,14 +79,27 @@ cmd_start() {
   [[ -n "$threshold" ]] && runner_cmd+=("--threshold" "$threshold")
 
   (
+    _secret_env=()
     if [[ -f "$ENV_FILE" ]]; then
       set -a
       # shellcheck disable=SC1090
       source "$ENV_FILE"
       set +a
+      # (#21) never blanket-export secrets: keep *private_key*/*mnemonic*/
+      # *seed* vars shell-local and hand them to the runner process only,
+      # so the ctl shell and sibling processes don't carry them in
+      # /proc/<pid>/environ. Non-secret config keeps the old blanket export.
+      while IFS= read -r _secret_var; do
+        _secret_env+=("$_secret_var=${!_secret_var}")
+        export -n "$_secret_var"
+      done < <(compgen -e | grep -iE 'private_key|mnemonic|seed' || true)
     fi
     cd "$REPO"
-    nohup "${runner_cmd[@]}" >"$log" 2>&1 &
+    if ((${#_secret_env[@]})); then
+      env "${_secret_env[@]}" nohup "${runner_cmd[@]}" >"$log" 2>&1 &
+    else
+      nohup "${runner_cmd[@]}" >"$log" 2>&1 &
+    fi
     echo $! >"$PIDFILE"
   )
 

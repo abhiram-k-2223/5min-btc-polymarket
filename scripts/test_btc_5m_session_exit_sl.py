@@ -949,6 +949,24 @@ def default_repo_path() -> str:
     return str(Path(__file__).resolve().parents[3] / 'pm-hl-conservative-plus-repo')
 
 
+def repo_path_error(path) -> Optional[str]:
+    """Fail-fast validation for the execution repo dir (#18).
+
+    Returns a human-readable error when ``path`` is empty or not a
+    directory, else None. The ``parents[3]`` fallback in
+    ``default_repo_path`` assumes a fixed checkout layout, so a wrong
+    layout must surface here — at startup — instead of as a confusing
+    failure deep in the entry loop.
+    """
+    if not path or not str(path).strip():
+        return ("execution repo path is empty "
+                "(set --repo or BTC5M_REPO to the execution checkout)")
+    if not os.path.isdir(str(path)):
+        return (f"execution repo not found: {path} "
+                "(set --repo or BTC5M_REPO to the execution checkout)")
+    return None
+
+
 def default_runtime_dir() -> str:
     env_dir = os.environ.get('BTC5M_RUNTIME_DIR')
     if env_dir:
@@ -997,6 +1015,11 @@ def main():
     args = apply_profile(ap.parse_args())
     if args.runtime_dir is None:
         args.runtime_dir = default_runtime_dir()
+    # Fail fast on a bad execution checkout (#18) instead of dying
+    # mid-run when the first subprocess call needs it.
+    _repo_err = repo_path_error(args.repo)
+    if _repo_err is not None:
+        ap.error(_repo_err)
     # Per-trade stake: explicit --stake-usd wins, else equity-derived (#11).
     stake_usd, stake_basis = resolve_stake_usd(args)
     # Graceful shutdown (#14): SIGTERM/SIGINT finish the run via the close
