@@ -5,3 +5,6 @@ __pycache__/
 runtime/
 data/
 problems.md
+
+# Private deploy notes (local only, never push)
+docs/DEPLOY_GCP.md
