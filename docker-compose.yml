@@ -4,6 +4,9 @@
 # Env names match the README overrides (BTC5M_REPO / BTC5M_ENV_FILE /
 # BTC5M_RUNTIME_DIR); BTC5M_EXEC_REPO points at the external execution repo
 # (pm-hl-conservative-plus-repo) whose .venv runs order open/close.
+# Prefer scripts/btc5m_docker.sh over raw `docker compose`: it resolves
+# these paths (honoring overrides, deriving the .env from the exec repo)
+# and fails fast with a clear message on non-standard layouts (#22).
 #
 # Dry-run session (default CMD, no orders):  docker compose up
 # Live session:  scripts/btc5m_docker.sh run -- --profile conservative --execute
