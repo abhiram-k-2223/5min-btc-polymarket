@@ -593,6 +593,7 @@ def run_close(
     execute: bool,
     close_order_type: str = 'FAK',
     close_limit_price: float | None = None,
+    side: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     cmd = [
         _repo_python(repo),
@@ -601,6 +602,9 @@ def run_close(
         '--close-token-id', token_id,
         '--close-shares', f'{shares:.8f}',
     ]
+    # Enables the paper shim's resolution settlement when the book is gone.
+    if side:
+        cmd += ['--close-side', str(side)]
     if close_limit_price is not None and close_limit_price > 0:
         cmd += ['--close-limit-price', f'{close_limit_price:.6f}']
     if execute:
@@ -653,6 +657,7 @@ def close_position(
             shares,
             execute,
             close_order_type='FAK',
+            side=side,
         )
         close_obj = objs[-1] if objs else {}
         post = close_obj.get('order_post_result') or {}
@@ -663,6 +668,8 @@ def close_position(
             'attempt': i + 1,
             'order_type': 'FAK',
             'status': status,
+            'reason': str(post.get('reason') or post.get('error')
+                          or close_obj.get('error') or ''),
             'close_skipped': skipped,
         })
         if post.get('success') is True and status == 'matched':
@@ -707,6 +714,7 @@ def close_position(
                 execute,
                 close_order_type='GTC',
                 close_limit_price=limit_px,
+                side=side,
             )
             close_obj2 = objs2[-1] if objs2 else {}
             post2 = close_obj2.get('order_post_result') or {}
@@ -716,6 +724,8 @@ def close_position(
                 'attempt': i + 1,
                 'order_type': 'GTC',
                 'status': status2,
+                'reason': str(post2.get('reason') or post2.get('error')
+                              or close_obj2.get('error') or ''),
                 'close_skipped': str(close_obj2.get('close_skipped') or ''),
                 'limit_price': limit_px,
             })
@@ -773,6 +783,7 @@ def close_position(
                     execute,
                     close_order_type='GTC',
                     close_limit_price=force_px,
+                    side=side,
                 )
                 close_obj3 = objs3[-1] if objs3 else {}
                 post3 = close_obj3.get('order_post_result') or {}
@@ -782,6 +793,8 @@ def close_position(
                     'attempt': i + 1,
                     'order_type': 'FORCE_GTC',
                     'status': status3,
+                    'reason': str(post3.get('reason') or post3.get('error')
+                                  or close_obj3.get('error') or ''),
                     'close_skipped': str(close_obj3.get('close_skipped') or ''),
                     'limit_price': force_px,
                 })
@@ -815,7 +828,10 @@ PROFILES: dict[str, dict[str, Any]] = {
     'conservative': {
         'threshold': 0.70,
         'stop_loss_pct': 0.25,
-        'exit_before_sec': 20,
+        # Exit ahead of the end-of-window quote pull: makers withdraw
+        # 5m books in the final seconds, and a bookless exit past expiry
+        # settles at resolution instead (#36).
+        'exit_before_sec': 40,
         'min_entry_seconds_left': 60,
         'entry_timeout_min': 60,
         'poll_sec': 5.0,
@@ -852,7 +868,8 @@ PROFILES: dict[str, dict[str, Any]] = {
     'aggressive': {
         'threshold': 0.65,
         'stop_loss_pct': 0.30,
-        'exit_before_sec': 20,
+        # Same end-of-window quote-pull reasoning as conservative (#36).
+        'exit_before_sec': 40,
         'min_entry_seconds_left': 60,
         'entry_timeout_min': 60,
         'poll_sec': 5.0,

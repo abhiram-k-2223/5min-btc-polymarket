@@ -7,6 +7,7 @@ pure/offline helpers are tested here — nothing touches the network.
 """
 import argparse
 import datetime as dt
+import json
 import os
 import re
 import sys
@@ -544,6 +545,77 @@ class RepoPathValidationTest(unittest.TestCase):
         self.assertEqual(r._repo_python("/nonexistent"), sys.executable)
         got = r._repo_python(tempfile.mkdtemp())
         self.assertTrue(os.path.isabs(got))
+
+
+class ClosePlumbingTest(unittest.TestCase):
+    """run_close flag plumbing + close_debug reasons + exit timing (#36)."""
+
+    def test_run_close_passes_slug_and_side(self):
+        seen = {}
+
+        class Proc:
+            stdout = '{"order_post_result": {"success": true}}'
+            stderr = ''
+
+        orig = r.subprocess.run
+
+        def fake_run(cmd, **k):
+            seen["cmd"] = cmd
+            return Proc()
+
+        r.subprocess.run = fake_run
+        try:
+            r.run_close("/repo", "slug-1", "TOK", 2.5, False, side="UP")
+        finally:
+            r.subprocess.run = orig
+        cmd = seen["cmd"]
+        self.assertIn("--market-slug", cmd)
+        self.assertIn("--close-side", cmd)
+        self.assertEqual(cmd[cmd.index("--close-side") + 1], "UP")
+
+    def test_run_close_omits_side_when_absent(self):
+        seen = {}
+
+        class Proc:
+            stdout = '{}'
+            stderr = ''
+
+        orig = r.subprocess.run
+
+        def fake_run(cmd, **k):
+            seen["cmd"] = cmd
+            return Proc()
+
+        r.subprocess.run = fake_run
+        try:
+            r.run_close("/repo", "slug-1", "TOK", 2.5, False)
+        finally:
+            r.subprocess.run = orig
+        self.assertNotIn("--close-side", seen["cmd"])
+
+    def test_close_debug_carries_reason(self):
+        obj = {"order_post_result": {"success": False, "status": "error",
+                                     "reason": "quote_unavailable"},
+               "error": "empty book side"}
+        out = json.dumps(obj)
+        orig_close, orig_auth = r.run_close, r.auth_clob_client
+        r.run_close = lambda *a, **k: (out, [obj])
+        r.auth_clob_client = lambda *a, **k: None
+        try:
+            _co, _out, dbg, _fb, _fc = r.close_position(
+                "/repo", "s", "UP", "T", 1.0, False,
+                close_retry_max=1, close_retry_delay_sec=0)
+        finally:
+            r.run_close, r.auth_clob_client = orig_close, orig_auth
+        self.assertEqual(len(dbg), 1)
+        self.assertEqual(dbg[0]["leg"], "main")
+        self.assertEqual(dbg[0]["reason"], "quote_unavailable")
+
+    def test_exit_before_sec_defaults_40(self):
+        cons = r.apply_profile(ProfileTest()._ns())
+        aggr = r.apply_profile(ProfileTest()._ns(profile="aggressive"))
+        self.assertEqual(cons.exit_before_sec, 40)
+        self.assertEqual(aggr.exit_before_sec, 40)
 
 
 class SlotScanTest(unittest.TestCase):

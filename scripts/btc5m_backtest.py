@@ -608,7 +608,7 @@ def _add_strategy_args(p) -> None:
     p.add_argument("--threshold", type=float, default=0.70)
     p.add_argument("--stake-usd", type=float, default=5.0)
     p.add_argument("--stop-loss-pct", type=float, default=0.30)
-    p.add_argument("--exit-before-sec", type=float, default=30.0)
+    p.add_argument("--exit-before-sec", type=float, default=40.0)
     p.add_argument("--min-entry-seconds-left", type=float, default=60.0)
     p.add_argument("--max-spread", type=float, default=0.03)
     p.add_argument("--min-top-ask-notional-usd", type=float, default=30.0)

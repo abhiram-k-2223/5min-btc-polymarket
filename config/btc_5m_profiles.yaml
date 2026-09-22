@@ -32,7 +32,9 @@ shared_rules:
   session_timing:
     monitor_continuous: true
     min_entry_seconds_left: 60
-    exit_before_sec: 20
+    # 40s: makers pull 5m books in the final seconds; exits past ~20s
+    # routinely face an empty book (#36).
+    exit_before_sec: 40
 
 profiles:
   conservative:

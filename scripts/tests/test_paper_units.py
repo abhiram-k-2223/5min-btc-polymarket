@@ -34,7 +34,7 @@ def _book(bid="0.30", bid_size="100", ask="0.32", ask_size="200"):
 
 def _run(argv, event=None, book=None, env=None):
     """Run main() with mocked HTTP; return (exit_code, stdout_json)."""
-    def fake_get(url, params=None, timeout=None):
+    def fake_get(url, params=None, timeout=None, **k):
         if "gamma-api" in url:
             return SimpleNamespace(status_code=200, json=lambda: [event or _event()],
                                    raise_for_status=lambda: None)
@@ -124,6 +124,84 @@ class CloseTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out["order_post_result"]["status"], "matched")
         self.assertAlmostEqual(out["fill_price"], 0.30)
+
+
+def _resolved_event(closed=True, prices=("1", "0")):
+    return {"slug": "btc-updown-5m-1",
+            "markets": [{"question": "Bitcoin Up or Down",
+                         "outcomes": ["Up", "Down"],
+                         "clobTokenIds": ["UPTOK", "DNTOK"],
+                         "closed": closed,
+                         "outcomePrices": list(prices)}]}
+
+
+def _run_close_nobook(argv, event):
+    """Close with an empty (pulled) book; Gamma returns `event`."""
+    def fake_get(url, params=None, timeout=None, **k):
+        if "gamma-api" in url:
+            return SimpleNamespace(status_code=200, json=lambda: [event],
+                                   raise_for_status=lambda: None)
+        return SimpleNamespace(status_code=200,
+                               json=lambda: {"bids": [], "asks": []},
+                               raise_for_status=lambda: None)
+
+    buf = io.StringIO()
+    with mock.patch.object(p.requests, "get", side_effect=fake_get), \
+         redirect_stdout(buf):
+        code = p.main(argv)
+    return code, json.loads(buf.getvalue())
+
+
+class CloseResolutionTest(unittest.TestCase):
+    """Resolution settlement when the book is gone near/after expiry (#36)."""
+
+    def test_resolved_itm_credits_full(self):
+        code, out = _run_close_nobook(
+            ["--market-slug", "s", "--close-token-id", "UPTOK",
+             "--close-shares", "9.411765", "--close-side", "UP"],
+            _resolved_event())
+        self.assertEqual(code, 0)
+        post = out["order_post_result"]
+        self.assertTrue(post["success"] is True)
+        self.assertEqual(post["status"], "matched")
+        self.assertEqual(out["fill_price_source"], "paper_resolution")
+        self.assertTrue(out["resolved"] is True)
+        self.assertAlmostEqual(post["takingAmount"], 9.411765)
+        self.assertAlmostEqual(post["makingAmount"], 9.411765)
+
+    def test_resolved_otm_credits_zero_but_matched(self):
+        code, out = _run_close_nobook(
+            ["--market-slug", "s", "--close-token-id", "DNTOK",
+             "--close-shares", "4.0", "--close-side", "DOWN"],
+            _resolved_event())
+        self.assertEqual(code, 0)
+        post = out["order_post_result"]
+        self.assertTrue(post["success"] is True)
+        self.assertEqual(post["status"], "matched")
+        self.assertAlmostEqual(post["takingAmount"], 0.0)
+
+    def test_open_market_never_resolves(self):
+        code, out = _run_close_nobook(
+            ["--market-slug", "s", "--close-token-id", "T",
+             "--close-shares", "4.0", "--close-side", "UP"],
+            _resolved_event(closed=False, prices=("0.60", "0.40")))
+        self.assertEqual(code, 1)
+        self.assertEqual(out["reason"], "quote_unavailable")
+
+    def test_closed_mid_prices_not_resolution(self):
+        code, out = _run_close_nobook(
+            ["--market-slug", "s", "--close-token-id", "T",
+             "--close-shares", "4.0", "--close-side", "UP"],
+            _resolved_event(closed=True, prices=("0.55", "0.45")))
+        self.assertEqual(code, 1)
+        self.assertEqual(out["reason"], "quote_unavailable")
+
+    def test_no_slug_falls_back_to_unavailable(self):
+        code, out = _run_close_nobook(
+            ["--close-token-id", "T", "--close-shares", "4.0"],
+            _resolved_event())
+        self.assertEqual(code, 1)
+        self.assertEqual(out["reason"], "quote_unavailable")
 
 
 class SafetyTest(unittest.TestCase):

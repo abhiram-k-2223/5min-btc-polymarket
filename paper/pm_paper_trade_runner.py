@@ -31,6 +31,10 @@ GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 CLOB_BOOK_URL = "https://clob.polymarket.com/book"
 HTTP_TIMEOUT = 12.0
 
+# Identifiable UA: default client UAs get intermittent 403s from
+# exchange/CDN WAFs (observed on the GCP paper VM).
+HTTP_HEADERS = {"User-Agent": "btc5m-paper/1.0 (+paper-trading bot)"}
+
 
 def log(msg: str) -> None:
     print(f"[paper] {msg}", file=sys.stderr, flush=True)
@@ -49,7 +53,8 @@ def _fnum(v, default=None):
 
 
 def fetch_event(slug: str) -> dict:
-    r = requests.get(GAMMA_EVENTS_URL, params={"slug": slug}, timeout=HTTP_TIMEOUT)
+    r = requests.get(GAMMA_EVENTS_URL, params={"slug": slug},
+                     headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     evs = r.json()
     if not evs:
@@ -66,15 +71,44 @@ def _as_list(v):
     return v if isinstance(v, list) else []
 
 
-def side_token_id(event: dict, side: str) -> str:
-    """Map UP/DOWN to a CLOB token id via outcomes[i] <-> clobTokenIds[i]."""
+def _outcome_index(event: dict, side: str):
+    """(market, idx) for side UP/DOWN via outcomes[i] <-> clobTokenIds[i]."""
     want = "up" if side.strip().upper() == "UP" else "down"
     for m in event.get("markets") or []:
         outcomes = [str(o).lower() for o in _as_list(m.get("outcomes"))]
         tokens = [str(t) for t in _as_list(m.get("clobTokenIds"))]
         if want in outcomes and len(tokens) == len(outcomes):
-            return tokens[outcomes.index(want)]
-    raise RuntimeError(f"no {want!r} token found for event {event.get('slug')!r}")
+            return m, outcomes.index(want)
+    return None, None
+
+
+def side_token_id(event: dict, side: str) -> str:
+    """Map UP/DOWN to a CLOB token id via outcomes[i] <-> clobTokenIds[i]."""
+    m, idx = _outcome_index(event, side)
+    if m is None:
+        raise RuntimeError(f"no {side.strip().upper()!r} token found for event {event.get('slug')!r}")
+    return [str(t) for t in _as_list(m.get("clobTokenIds"))][idx]
+
+
+def resolution_price(event: dict, side: str):
+    """Final $/share for side once the market has resolved, else None.
+
+    Only fires when the market is closed AND prices have snapped to ~1/0,
+    so a mid-market poll (even in the final seconds) can never be
+    mistaken for a resolution payout.
+    """
+    m, idx = _outcome_index(event, side)
+    if m is None or m.get("closed") is not True:
+        return None
+    try:
+        px = [float(x) for x in (m.get("outcomePrices") or [])]
+    except (TypeError, ValueError):
+        return None
+    if len(px) != len(_as_list(m.get("outcomes"))) or not px:
+        return None
+    if max(px) < 0.999:
+        return None
+    return px[idx]
 
 
 def fetch_book(token_id: str, retries: int = 2) -> dict:
@@ -87,7 +121,7 @@ def fetch_book(token_id: str, retries: int = 2) -> dict:
     for attempt in range(max(1, retries) + 1):
         try:
             r = requests.get(CLOB_BOOK_URL, params={"token_id": token_id},
-                             timeout=HTTP_TIMEOUT)
+                             headers=HTTP_HEADERS, timeout=HTTP_TIMEOUT)
             if r.status_code == 404:
                 raise RuntimeError(f"no orderbook for token {token_id[:16]}...")
             r.raise_for_status()
@@ -193,7 +227,37 @@ def do_close(args) -> int:
         book = fetch_book(args.close_token_id)
         best_bid, _best_ask, _b, _a = top_of_book(book)
     except Exception as e:
-        return fail("quote_unavailable", error=str(e)[:200])
+        # Book gone (makers pull quotes near/after expiry): settle at the
+        # market resolution when available instead of a $0 dead end.
+        resolved = None
+        if args.market_slug and getattr(args, "close_side", None):
+            try:
+                resolved = resolution_price(
+                    fetch_event(args.market_slug), args.close_side)
+            except Exception:
+                resolved = None
+        if resolved is None:
+            return fail("quote_unavailable", error=str(e)[:200])
+        proceeds = shares * resolved
+        oid = paper_id("paper-resolve")
+        log(f"RESOLVE {args.close_side} {args.market_slug} price={resolved:.4f} "
+            f"shares={shares:.4f} proceeds=${proceeds:.2f}")
+        emit({
+            "close_token_id": args.close_token_id,
+            "close_shares": round(shares, 6),
+            "fill_price": round(resolved, 6),
+            "fill_price_source": "paper_resolution",
+            "resolved": True,
+            "order_post_result": {
+                "success": True,
+                "status": "matched",
+                "takingAmount": round(proceeds, 6),
+                "makingAmount": round(shares, 6),
+                "orderID": oid,
+                "transactionsHashes": [oid],
+            },
+        })
+        return 0
 
     limit = _fnum(args.close_limit_price)
     if limit is not None and limit > 0 and best_bid < limit:
@@ -236,6 +300,8 @@ def main(argv=None) -> int:
     ap.add_argument("--max-notional-usd", type=float, default=None)
     ap.add_argument("--close-token-id", default=None)
     ap.add_argument("--close-shares", type=float, default=None)
+    ap.add_argument("--close-side", default=None,
+                    help="UP/DOWN: enables resolution settlement on close when the book is gone")
     ap.add_argument("--close-limit-price", type=float, default=None)
     ap.add_argument("--execute", action="store_true",
                     help="REFUSED by the paper simulator (safety)")
