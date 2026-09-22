@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import os
 import subprocess
+import sys
 import time
 from typing import Any, Optional
 from pathlib import Path
@@ -526,6 +527,21 @@ def cancel_token_orders(client: Optional[ClobClient], token_id: str) -> Optional
         return {'error': str(e)}
 
 
+def _repo_python(repo: str) -> str:
+    """Interpreter for the external execution runner (#35).
+
+    Prefers the execution checkout's own venv (upstream layout), but
+    falls back to the current interpreter when it is absent — e.g. the
+    paper shim runs inside the container image, which has no
+    ``.venv``. Previously the bare relative ``.venv/bin/python``
+    ENOENT'd on every open/close attempt in-container.
+    """
+    venv_py = os.path.join(str(repo or ''), '.venv', 'bin', 'python')
+    if os.path.isfile(venv_py) and os.access(venv_py, os.X_OK):
+        return venv_py
+    return sys.executable
+
+
 def run_open(
     repo: str,
     slug: str,
@@ -542,7 +558,7 @@ def run_open(
     except (TypeError, ValueError):
         equity = 100.0
     cmd = [
-        '.venv/bin/python',
+        _repo_python(repo),
         'src/live/pm_live_trade_runner.py',
         '--market-slug', slug,
         '--force-side', side,
@@ -579,7 +595,7 @@ def run_close(
     close_limit_price: float | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     cmd = [
-        '.venv/bin/python',
+        _repo_python(repo),
         'src/live/pm_live_trade_runner.py',
         '--market-slug', slug,
         '--close-token-id', token_id,

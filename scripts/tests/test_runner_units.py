@@ -521,6 +521,30 @@ class RepoPathValidationTest(unittest.TestCase):
         import tempfile
         self.assertIsNone(r.repo_path_error(tempfile.mkdtemp()))
 
+    def test_repo_python_prefers_venv(self):
+        # #35: execution checkout with a venv uses its interpreter.
+        import os
+        import stat
+        import tempfile
+        d = tempfile.mkdtemp()
+        bindir = os.path.join(d, ".venv", "bin")
+        os.makedirs(bindir)
+        py = os.path.join(bindir, "python")
+        with open(py, "w") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(py, os.stat(py).st_mode | stat.S_IXUSR)
+        self.assertEqual(r._repo_python(d), py)
+
+    def test_repo_python_falls_back_without_venv(self):
+        # #35: no .venv (container/paper image) -> current interpreter,
+        # never a bare relative path that ENOENTs under cwd=repo.
+        import sys
+        import tempfile
+        self.assertEqual(r._repo_python(tempfile.mkdtemp()), sys.executable)
+        self.assertEqual(r._repo_python("/nonexistent"), sys.executable)
+        got = r._repo_python(tempfile.mkdtemp())
+        self.assertTrue(os.path.isabs(got))
+
 
 class SlotScanTest(unittest.TestCase):
     """closest_valid slot selection across candidate_slots (#17)."""
