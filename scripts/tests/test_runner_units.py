@@ -6,6 +6,7 @@ module injects lightweight stubs into ``sys.modules`` before import. Only
 pure/offline helpers are tested here — nothing touches the network.
 """
 import argparse
+import datetime as dt
 import os
 import re
 import sys
@@ -432,6 +433,76 @@ class RepoPathValidationTest(unittest.TestCase):
     def test_existing_dir_passes(self):
         import tempfile
         self.assertIsNone(r.repo_path_error(tempfile.mkdtemp()))
+
+
+class SlotScanTest(unittest.TestCase):
+    """closest_valid slot selection across candidate_slots (#17)."""
+
+    def _ev(self, end_ts, closed=False, active=True):
+        end_iso = dt.datetime.fromtimestamp(end_ts, dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        return {"markets": [{"closed": closed, "active": active,
+                             "slug": "m", "endDate": end_iso,
+                             "outcomes": ["Up", "Down"],
+                             "outcomePrices": ["0.5", "0.5"],
+                             "clobTokenIds": ["1", "2"]}]}
+
+    def _fetch(self, by_bucket):
+        box: dict[str, list] = {"calls": []}
+
+        def fake(slug):
+            box["calls"].append(slug)
+            try:
+                b = int(slug.rsplit("-", 1)[1])
+            except (ValueError, IndexError):
+                return None
+            return by_bucket.get(b)
+
+        return fake, box["calls"]
+
+    def test_current_valid_costs_one_call(self):
+        now = time.time()
+        cur = r.bucket_5m(int(now))
+        fetch, calls = self._fetch({cur: self._ev(now + 200)})
+        mm = r.choose_slot_market(now, ["prev", "current", "next", "next2"], 60,
+                                  fetch=fetch)
+        self.assertIsNotNone(mm)
+        assert mm is not None
+        self.assertEqual(mm["_slot"], "current")
+        self.assertEqual(len(calls), 1)
+
+    def test_too_late_current_falls_through_to_next(self):
+        now = time.time()
+        cur = r.bucket_5m(int(now))
+        fetch, _calls = self._fetch({cur: self._ev(now + 30),  # resolves, but < 60s left
+                                 cur + 300: self._ev(cur + 600)})
+        mm = r.choose_slot_market(now, "prev,current,next,next2", 60, fetch=fetch)
+        self.assertIsNotNone(mm)
+        assert mm is not None
+        self.assertEqual(mm["_slot"], "next")
+
+    def test_none_valid_returns_none(self):
+        now = time.time()
+        cur = r.bucket_5m(int(now))
+        fetch, _calls = self._fetch({cur: self._ev(now - 10)})  # already over
+        self.assertIsNone(r.choose_slot_market(now, ["current", "next"], 60,
+                                               fetch=fetch))
+
+    def test_fetch_errors_are_skipped(self):
+        def boom(slug):
+            raise IOError("gamma down")
+
+        self.assertIsNone(r.choose_slot_market(time.time(), ["current"], 60,
+                                               fetch=boom))
+
+    def test_closed_market_skipped(self):
+        now = time.time()
+        cur = r.bucket_5m(int(now))
+        fetch, _calls = self._fetch({cur: self._ev(cur + 300, closed=True),
+                                 cur + 300: self._ev(cur + 600)})
+        mm = r.choose_slot_market(now, ["current", "next"], 60, fetch=fetch)
+        assert mm is not None
+        self.assertEqual(mm["_slot"], "next")
 
 
 if __name__ == "__main__":

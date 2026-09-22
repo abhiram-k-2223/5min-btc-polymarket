@@ -142,21 +142,21 @@ data are flagged `end_of_data` and excluded from metrics.
 ## Execution Checklist (Before Live Trade)
 Use this quick pre-flight checklist before any real order:
 
-1. **Market validity**
+1. **Market validity** (automated: slot scan rejects closed/inactive/ending markets)
    - Confirm the BTC 5m market is active and not about to close unexpectedly.
-2. **Time-to-close window**
+2. **Time-to-close window** (operator judgment; runner enforces only the minimum)
    - Prefer entries around ~120 seconds left (with reasonable tolerance).
-3. **Impulse confirmation**
+3. **Impulse confirmation** (automated: `--btc-move-usd-min` since market open)
    - Confirm the observed BTC move is meaningful (strategy reference: ~$70-$100).
-4. **Skew confirmation**
+4. **Skew confirmation** (automated: `--skew-veto-threshold` vetoes opposed entries)
    - Verify market skew supports the intended direction (do not fade strong momentum by default).
-5. **Liquidity/spread checks**
+5. **Liquidity/spread checks** (automated: spread / top-ask-notional / quote-age gates)
    - Ensure spread and top-of-book notional pass your minimum thresholds.
-6. **Sizing guardrails**
+6. **Sizing guardrails** (automated: equity-based stake cap + daily loss / max-trades ledger)
    - Validate stake, max notional, and daily loss limits before execution.
-7. **Stop / exit controls**
+7. **Stop / exit controls** (automated: CLOB-bid stop-loss + `exit_before_sec`)
    - Confirm stop-loss and `exit_before_sec` are configured.
-8. **Execution mode**
+8. **Execution mode** (operator: pass `--execute` explicitly)
    - Start in dry-run when changing parameters; switch to `--execute` only after validation.
 
 ## Risk Controls Template

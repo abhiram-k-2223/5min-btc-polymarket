@@ -111,6 +111,8 @@ runner_mapping:
     - "--btc-move-usd-min"
     - "--skew-veto-threshold"
     - "--disable-momentum"
+    - "--candidate-slots"
+  slot_semantics: "The entry loop scans candidate_slots (default prev,current,next,next2; YAML market_validation.candidate_slots) and picks the closest slot whose market is active, unclosed, and has at least min_entry_seconds_left remaining (future preferred on ties). The current slot is tried first so the common path costs one Gamma call; future slots let the bot lock onto the next market at slot boundaries instead of spinning. Momentum gating blocks premature entry (move ~0 before open). Chosen slot is logged per heartbeat and in report params."
   momentum_semantics: "Entry follows the BTC move since market open (Binance 1m klines, cached 30s): side = move direction once |move| clears btc_move_usd_min (70 conservative, 50 aggressive); --threshold stays as a minimum-price floor on the picked side; skew_veto blocks entries against strong crowd flow (0.10 conservative, 0.15 aggressive). --disable-momentum restores the legacy highest-ask trigger."
   sizing_semantics: "--stake-usd is an explicit override only. When unset, the runner derives the stake as equity_usd * risk_per_trade_pct / 100 capped at max_notional_usd (8%/8 conservative, 15%/15 aggressive), floored at $1."
   hedge_semantics: "The micro-hedge is live: when the held-side CLOB bid reaches hedge_trigger_price with at most hedge_trigger_seconds_left remaining, the runner buys hedge_share_of_main_pct of the main cost (clamped to hedge min/max notional) on the opposite side, once per run, and closes it through the same cascade with combined PnL. --disable-hedge turns it off."
@@ -120,7 +122,6 @@ runner_mapping:
   example_aggressive_now: ".venv/bin/python scripts/test_btc_5m_session_exit_sl.py --profile aggressive --execute  # threshold 0.65, looser guards, stake = 15% of equity capped at $15"
 
 notes:
-  - "Current 5m runner uses threshold/side-strength logic; impulse filter integration can be extended at strategy layer."
-  - "Entry behavior: continuous CLOB ask monitoring; if UP/DOWN >= threshold, enter on stronger side."
+  - "Entry follows BTC momentum since market open (see runner_mapping.momentum_semantics); the legacy highest-ask trigger survives only under --disable-momentum for comparison runs."
   - "Enforced by the runner (scripts/test_btc_5m_session_exit_sl.py + scripts/btc5m_guards.py): picked-side spread gate (skip_if_spread_gt), top-ask notional gate (skip_if_top_ask_notional_usd_lt), quote-age gate (skip_if_quote_stale_sec_gt, best-effort via book timestamp), consecutive-error abort (skip_if_dns_or_api_errors_consecutive), and a UTC-day risk ledger for max_trades_per_day / daily_max_loss_pct (live trades only). Values mirrored in the runner PROFILES dict; all overridable via CLI flags."
   - "Stop-loss is monitored at the CLOB best bid of the held token (executable price), not the Gamma mid."

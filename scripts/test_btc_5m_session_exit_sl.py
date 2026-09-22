@@ -193,14 +193,16 @@ def fetch_event(slug: str) -> Optional[dict[str, Any]]:
     return arr[0] if arr else None
 
 
-def resolve_active_current_5m_market() -> Optional[dict[str, Any]]:
-    """Return active BTC 5m market for the current slot only."""
-    now = int(time.time())
-    cur = bucket_5m(now)
-    slug = f'btc-updown-5m-{cur}'
+def resolve_slot_market(slot_ts: int, fetch=fetch_event) -> Optional[dict[str, Any]]:
+    """Fetch + validate the BTC 5m market for one slot timestamp (#17).
 
+    A slot is usable when its event resolves to a market that is active,
+    not closed, and ends more than 5s out. ``fetch`` is injectable for
+    unit tests (defaults to the live Gamma lookup).
+    """
+    slug = f'btc-updown-5m-{slot_ts}'
     try:
-        ev = fetch_event(slug)
+        ev = fetch(slug)
     except Exception:
         return None
     if not ev:
@@ -230,6 +232,62 @@ def resolve_active_current_5m_market() -> Optional[dict[str, Any]]:
     mm['_event_slug'] = slug
     mm['_seconds_left'] = sec_left
     return mm
+
+
+def resolve_active_current_5m_market() -> Optional[dict[str, Any]]:
+    """Return active BTC 5m market for the current slot only.
+
+    Kept for compatibility (watcher/tests); the entry loop uses
+    choose_slot_market() across candidate_slots (#17).
+    """
+    now = int(time.time())
+    return resolve_slot_market(bucket_5m(now))
+
+
+# Slot offsets in seconds relative to the current 5m bucket (#17).
+# Mirrors config/btc_5m_profiles.yaml market_validation.candidate_slots.
+SLOT_OFFSETS = {"prev": -300, "current": 0, "next": 300, "next2": 600}
+
+
+def choose_slot_market(now: float, candidate_slots, min_seconds_left: float,
+                       fetch=fetch_event) -> Optional[dict[str, Any]]:
+    """Pick the closest valid slot market (YAML ``choose: closest_valid``).
+
+    The current slot is tried first (lazy: the common path costs one Gamma
+    call). If it is missing or has less than ``min_seconds_left`` left,
+    the remaining candidates are tried nearest-first (future preferred on
+    ties — a past slot is already over). Returns the market tagged with
+    ``_slot``, or None when no slot is tradeable right now.
+    """
+    slots = candidate_slots
+    if isinstance(slots, str):
+        slots = slots.split(',')
+    slots = [str(s).strip() for s in (slots or []) if str(s).strip()]
+    if "current" in slots:
+        ordered: list[str] = ["current"]
+    else:
+        ordered = []
+
+    def _dist(name: str) -> tuple[float, int]:
+        off = SLOT_OFFSETS.get(name, 0)
+        # future slots sort before past ones on ties
+        return (abs(off), 0 if off >= 0 else 1)
+
+    ordered += sorted([s for s in slots if s != "current"], key=_dist)
+    cur_bucket = bucket_5m(int(now))
+    for name in ordered:
+        mm = resolve_slot_market(cur_bucket + SLOT_OFFSETS.get(name, 0), fetch=fetch)
+        if mm is None:
+            continue
+        try:
+            left = float(mm.get('_seconds_left') or 0)
+        except (TypeError, ValueError):
+            continue
+        if left < float(min_seconds_left):
+            continue
+        mm['_slot'] = name
+        return mm
+    return None
 
 
 def parse_json_field(v):
@@ -996,6 +1054,7 @@ def main():
     ap.add_argument('--btc-move-usd-min', type=float, default=None, help='Min |BTC move| since market open to allow entry; side follows the move (default: 70 conservative, 50 aggressive; #1, #3)')
     ap.add_argument('--skew-veto-threshold', type=float, default=None, help='Veto entry when skew opposes momentum beyond this (default: 0.10 conservative, 0.15 aggressive; #2)')
     ap.add_argument('--disable-momentum', action='store_true', help='Restore the legacy highest-ask entry trigger (comparison runs only; #3)')
+    ap.add_argument('--candidate-slots', default='prev,current,next,next2', help='Comma-separated slot scan list; the entry loop picks the closest slot with a tradeable market (mirrors YAML candidate_slots; #17)')
     ap.add_argument('--hedge-trigger-seconds-left', type=int, default=None, help='... and at most this many seconds remain (default: 45 conservative, 50 aggressive)')
     ap.add_argument('--hedge-share-pct', type=float, default=None, help='Hedge notional as pct of main cost (default: 3 conservative, 5 aggressive)')
     ap.add_argument('--hedge-min-notional-usd', type=float, default=None, help='Floor on hedge notional (default 1.0)')
@@ -1067,6 +1126,7 @@ def main():
             'btc_move_usd_min': args.btc_move_usd_min,
             'skew_veto_threshold': args.skew_veto_threshold,
             'disable_momentum': args.disable_momentum,
+            'candidate_slots': args.candidate_slots,
         },
         'attempts': [],
         'attempts_dropped': 0,
@@ -1135,7 +1195,8 @@ def main():
                     abort_run('blocked_' + _reason, 'blocked')
                     return
 
-            m = resolve_active_current_5m_market()
+            m = choose_slot_market(time.time(), args.candidate_slots,
+                                   args.min_entry_seconds_left)
             if not m:
                 log_attempt(report, {'ts': ts_utc(), 'status': 'heartbeat_no_current_market'})
                 err_streak = 0
@@ -1191,6 +1252,7 @@ def main():
             log_attempt(report, {
                 'ts': ts_utc(),
                 'slug': slug,
+                'slot': m.get('_slot', 'current'),
                 'status': 'heartbeat',
                 'gamma_up': g_up,
                 'gamma_down': g_dn,
