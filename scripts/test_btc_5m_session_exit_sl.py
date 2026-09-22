@@ -23,6 +23,7 @@ from btc5m_guards import (
     load_ledger,
     load_open_position,
     momentum_direction,
+    nodata_budget_exceeded,
     position_in_tokens,
     record_close,
     record_open,
@@ -798,6 +799,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         'min_top_ask_notional_usd': 30.0,
         'max_quote_age_sec': 8.0,
         'max_consecutive_errors': 3,
+        'max_no_btc_data_sec': 600.0,
         # Session risk ledger (mirror config profiles sizing caps).
         'max_trades_per_day': 12,
         'daily_max_loss_pct': 10.0,
@@ -833,6 +835,7 @@ PROFILES: dict[str, dict[str, Any]] = {
         'min_top_ask_notional_usd': 20.0,
         'max_quote_age_sec': 12.0,
         'max_consecutive_errors': 3,
+        'max_no_btc_data_sec': 600.0,
         'max_trades_per_day': 20,
         'daily_max_loss_pct': 15.0,
         'equity_usd': 100.0,
@@ -871,6 +874,7 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
         ('min_top_ask_notional_usd', float),
         ('max_quote_age_sec', float),
         ('max_consecutive_errors', int),
+        ('max_no_btc_data_sec', float),
         ('max_trades_per_day', int),
         ('daily_max_loss_pct', float),
         ('equity_usd', float),
@@ -1103,6 +1107,7 @@ def main():
     ap.add_argument('--min-top-ask-notional-usd', type=float, default=None, help='Skip entry if picked-side top ask notional (USD) is below this')
     ap.add_argument('--max-quote-age-sec', type=float, default=None, help='Skip entry if CLOB quote age exceeds this')
     ap.add_argument('--max-consecutive-errors', type=int, default=None, help='Abort run after this many consecutive API/execution errors')
+    ap.add_argument('--max-no-btc-data-sec', type=float, default=None, help='Abort run after the BTC reference feed is continuously unavailable this long (seconds; blip-tolerant time budget)')
     ap.add_argument('--max-trades-per-day', type=int, default=None, help='Block new entries after this many live trades today (UTC)')
     ap.add_argument('--daily-max-loss-pct', type=float, default=None, help='Block new entries after losing this pct of equity today (UTC)')
     ap.add_argument('--equity-usd', type=float, default=None, help='Account equity reference for the daily-loss cap')
@@ -1148,6 +1153,7 @@ def main():
             'min_top_ask_notional_usd': args.min_top_ask_notional_usd,
             'max_quote_age_sec': args.max_quote_age_sec,
             'max_consecutive_errors': args.max_consecutive_errors,
+            'max_no_btc_data_sec': args.max_no_btc_data_sec,
             'max_trades_per_day': args.max_trades_per_day,
             'daily_max_loss_pct': args.daily_max_loss_pct,
             'equity_usd': args.equity_usd,
@@ -1175,6 +1181,7 @@ def main():
     deadline = time.time() + args.entry_timeout_min * 60
     opened = None
     err_streak = 0
+    nodata_streak = 0
     # Session risk ledger (#4, #5): live trades only; dry-runs neither
     # consume the daily budget nor enforce it.
     ledger_file = ledger_path(args.runtime_dir) if args.execute else None
@@ -1321,22 +1328,34 @@ def main():
                 m_open_ts = end_ts - 300.0 if end_ts else None
                 btc_rows = (btc_series_cached(slug, m_open_ts, time.time())
                             if m_open_ts else [])
-                if not btc_rows_fresh(btc_rows, time.time()):
+                now_ts = time.time()
+                if not btc_rows_fresh(btc_rows, now_ts):
                     # No usable BTC history (feed down / geo-blocked / stale
-                    # cache). This is data absence, NOT flat momentum: count
-                    # it toward the error budget instead of resetting it.
+                    # cache). Data absence is NOT flat momentum: track it on
+                    # its own time budget — a seconds-long blip must not kill
+                    # a 60-min session (incident 2026-09-22).
+                    try:
+                        newest_age = (now_ts - max(float(t) for t, _ in btc_rows)
+                                      if btc_rows else None)
+                    except (TypeError, ValueError):
+                        newest_age = None
                     log_attempt(report, {
                         'ts': ts_utc(),
                         'slug': slug,
                         'status': 'skip_no_btc_data',
+                        'btc_rows': len(btc_rows),
+                        'newest_age_sec': (round(newest_age, 1)
+                                           if newest_age is not None else None),
                         'seconds_left': sec_left,
                     })
-                    err_streak += 1
-                    if error_budget_exceeded(err_streak, args.max_consecutive_errors):
-                        abort_run('aborted_consecutive_errors', 'aborted')
+                    nodata_streak += 1
+                    if nodata_budget_exceeded(nodata_streak, args.poll_sec,
+                                              args.max_no_btc_data_sec):
+                        abort_run('aborted_no_btc_data', 'aborted')
                         return
                     time.sleep(args.poll_sec)
                     continue
+                nodata_streak = 0
                 btc_open_px = btc_close_at(btc_rows, m_open_ts) if m_open_ts else None
                 btc_now_px = btc_close_at(btc_rows, time.time())
                 if btc_now_px is None:

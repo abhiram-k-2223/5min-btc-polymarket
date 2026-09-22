@@ -121,5 +121,22 @@ class MomentumSkewTest(unittest.TestCase):
         self.assertFalse(g.skew_veto("SIDEWAYS", 0.7, 0.3, 0.10))
 
 
+class NoDataBudgetTest(unittest.TestCase):
+    """nodata_budget_exceeded is a time budget: short blips must not trip
+    it, sustained outages must (production incident 2026-09-22)."""
+
+    def test_blip_tolerant(self):
+        self.assertFalse(g.nodata_budget_exceeded(3, 5.0, 600.0))
+        self.assertFalse(g.nodata_budget_exceeded(119, 5.0, 600.0))
+
+    def test_sustained_outage_trips(self):
+        self.assertTrue(g.nodata_budget_exceeded(120, 5.0, 600.0))
+        self.assertTrue(g.nodata_budget_exceeded(200, 5.0, 600.0))
+
+    def test_bad_inputs_fail_closed(self):
+        self.assertFalse(g.nodata_budget_exceeded(None, 5.0, 600.0))
+        self.assertFalse(g.nodata_budget_exceeded(3, 5.0, None))
+
+
 if __name__ == "__main__":
     unittest.main()

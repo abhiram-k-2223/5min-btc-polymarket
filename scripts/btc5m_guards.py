@@ -177,6 +177,22 @@ def error_budget_exceeded(streak: int, max_allowed: int) -> bool:
         return False
 
 
+def nodata_budget_exceeded(streak: int, poll_sec: float,
+                           max_no_data_sec: float) -> bool:
+    """True when the BTC reference feed has been continuously unavailable
+    for at least ``max_no_data_sec``.
+
+    Production incident 2026-09-22: two sessions aborted on 3-strikes
+    (~12s) over transient feed blips (cold-start DNS, a ~15s Coinbase
+    hiccup). A short feed outage must not kill a 60-min session, so unlike
+    error_budget_exceeded this is a *time* budget, not a strike counter.
+    """
+    try:
+        return float(streak) * float(poll_sec) >= float(max_no_data_sec)
+    except (TypeError, ValueError):
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Open-position state file (item #33 — crash recovery)
 # ---------------------------------------------------------------------------

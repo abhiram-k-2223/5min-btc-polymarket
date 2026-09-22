@@ -111,6 +111,7 @@ class ProfileTest(unittest.TestCase):
             min_entry_seconds_left=None, entry_timeout_min=None, poll_sec=None,
             max_spread=None, min_top_ask_notional_usd=None,
             max_quote_age_sec=None, max_consecutive_errors=None,
+            max_no_btc_data_sec=None,
             max_trades_per_day=None, daily_max_loss_pct=None, equity_usd=None,
         )
         base.update(kw)
@@ -121,6 +122,7 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual((a.threshold, a.stop_loss_pct), (0.70, 0.25))
         self.assertEqual((a.max_spread, a.min_top_ask_notional_usd, a.max_quote_age_sec), (0.03, 30.0, 8.0))
         self.assertEqual((a.max_consecutive_errors, a.max_trades_per_day), (3, 12))
+        self.assertEqual(a.max_no_btc_data_sec, 600.0)
         self.assertEqual((a.daily_max_loss_pct, a.equity_usd), (10.0, 100.0))
         self.assertEqual((a.risk_per_trade_pct, a.max_notional_usd), (8.0, 8.0))
         # stake_usd is explicit-override-only: profile fill must leave it None
@@ -134,6 +136,7 @@ class ProfileTest(unittest.TestCase):
         self.assertEqual((a.risk_per_trade_pct, a.max_notional_usd), (15.0, 15.0))
         # looser execution guards = higher frequency
         self.assertEqual((a.max_spread, a.min_top_ask_notional_usd, a.max_quote_age_sec), (0.05, 20.0, 12.0))
+        self.assertEqual(a.max_no_btc_data_sec, 600.0)
 
     def test_explicit_cli_values_preserved(self):
         a = r.apply_profile(self._ns(threshold=0.65, max_trades_per_day=5))
