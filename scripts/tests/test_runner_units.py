@@ -424,6 +424,38 @@ class MomentumHelpersTest(unittest.TestCase):
         finally:
             r.requests.get = orig
 
+    def test_outbound_http_sends_identifiable_ua(self):
+        # #35: default client UAs get intermittent 403s from exchange WAFs.
+        # Every outbound call must carry our explicit User-Agent.
+        seen = []
+
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return []
+
+            def raise_for_status(self):
+                pass
+
+        def fake_get(url, *a, **k):
+            seen.append((url, k.get("headers", {})))
+            return Resp()
+
+        orig = r.requests.get
+        r.requests.get = fake_get
+        try:
+            r.fetch_btc_klines_1m(1.0, 2.0)
+            r.btc_spot_usd()
+            r.wallet_positions("0xabc")
+            r.fetch_event("btc-updown-5m-1")
+        finally:
+            r.requests.get = orig
+        self.assertGreaterEqual(len(seen), 5)  # binance+cb klines, 2x spot, data-api, gamma
+        for url, headers in seen:
+            self.assertIn("User-Agent", headers, url)
+            self.assertNotIn("python", headers["User-Agent"].lower(), url)
+
     def test_btc_rows_fresh(self):
         self.assertFalse(r.btc_rows_fresh([], 1000.0))
         self.assertFalse(r.btc_rows_fresh([(100.0, 90.0)], 1000.0))

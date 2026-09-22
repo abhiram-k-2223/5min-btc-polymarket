@@ -67,6 +67,13 @@ def log_attempt(report: dict[str, Any], entry: dict[str, Any]) -> None:
         report['attempts_dropped'] = report.get('attempts_dropped', 0) + 1
 
 
+# Identifiable UA on every outbound HTTP call (#35). Default client UAs
+# (Python-urllib, python-requests) are intermittently 403-challenged by
+# exchange WAFs — observed as deterministic in-container 403s on the
+# Coinbase candles endpoint while host curl passed.
+HTTP_HEADERS = {'User-Agent': 'btc5m-paper/1.0 (+paper-trading bot)'}
+
+
 def btc_spot_usd(timeout: float = 8.0) -> Optional[float]:
     """Spot BTC/USD for trade context (#26). Binance first, Coinbase
     fallback. Best-effort: returns None on any failure, never raises."""
@@ -78,7 +85,7 @@ def btc_spot_usd(timeout: float = 8.0) -> Optional[float]:
     ]
     for url, pick in sources:
         try:
-            r = requests.get(url, timeout=timeout)
+            r = requests.get(url, headers=HTTP_HEADERS, timeout=timeout)
             if r.status_code != 200:
                 continue
             px = _fnum(pick(r.json()))
@@ -99,7 +106,7 @@ def wallet_positions(wallet: str, timeout: float = 10.0) -> list:
     never raises — callers treat failure as 'unknown' and fail open."""
     try:
         r = requests.get(DATA_API_POSITIONS_URL, params={'user': wallet},
-                         timeout=timeout)
+                         headers=HTTP_HEADERS, timeout=timeout)
         if r.status_code != 200:
             return []
         obj = r.json()
@@ -125,6 +132,7 @@ def fetch_btc_klines_1m(start_ts: float, end_ts: float,
     Returns [] only when both sources fail — callers fail closed."""
     try:
         r = requests.get(BINANCE_KLINES_URL,
+                         headers=HTTP_HEADERS,
                          params={'symbol': 'BTCUSDT', 'interval': '1m',
                                  'startTime': int(start_ts * 1000),
                                  'endTime': int(end_ts * 1000), 'limit': 1000},
@@ -142,6 +150,7 @@ def fetch_btc_klines_1m(start_ts: float, end_ts: float,
         pass
     try:
         r = requests.get(COINBASE_CANDLES_URL,
+                         headers=HTTP_HEADERS,
                          params={'start': int(start_ts), 'end': int(end_ts),
                                  'granularity': 60},
                          timeout=timeout)
@@ -228,7 +237,7 @@ def bucket_5m(ts: int) -> int:
 
 
 def fetch_event(slug: str) -> Optional[dict[str, Any]]:
-    r = requests.get('https://gamma-api.polymarket.com/events', params={'slug': slug}, timeout=12)
+    r = requests.get('https://gamma-api.polymarket.com/events', params={'slug': slug}, headers=HTTP_HEADERS, timeout=12)
     r.raise_for_status()
     arr = r.json()
     return arr[0] if arr else None
