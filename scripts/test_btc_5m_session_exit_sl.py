@@ -108,6 +108,7 @@ def wallet_positions(wallet: str, timeout: float = 10.0) -> list:
 
 
 BINANCE_KLINES_URL = 'https://api.binance.com/api/v3/klines'
+COINBASE_CANDLES_URL = 'https://api.exchange.coinbase.com/products/BTC-USD/candles'
 
 # Per-market 1m BTC close cache (#1): refreshed at most every 30s so each
 # poll does not cost an HTTP round-trip.
@@ -116,25 +117,46 @@ _btc_klines_cache: dict[str, tuple[float, list]] = {}
 
 def fetch_btc_klines_1m(start_ts: float, end_ts: float,
                         timeout: float = 10.0) -> list:
-    """1-minute (open_epoch, close) BTC klines via Binance (#1, momentum
-    reference). Returns [] on any failure — callers fail closed."""
+    """1-minute (open_epoch, close) BTC klines (#1, momentum reference).
+
+    Binance first, Coinbase Exchange candles fallback (Binance.com
+    geo-blocks US IPs with HTTP 451, which silently zeroed this feed).
+    Returns [] only when both sources fail — callers fail closed."""
     try:
         r = requests.get(BINANCE_KLINES_URL,
                          params={'symbol': 'BTCUSDT', 'interval': '1m',
                                  'startTime': int(start_ts * 1000),
                                  'endTime': int(end_ts * 1000), 'limit': 1000},
                          timeout=timeout)
-        if r.status_code != 200:
-            return []
-        out = []
-        for k in r.json():
-            try:
-                out.append((float(k[0]) / 1000.0, float(k[4])))
-            except (TypeError, ValueError, IndexError):
-                continue
-        return out
+        if r.status_code == 200:
+            out = []
+            for k in r.json():
+                try:
+                    out.append((float(k[0]) / 1000.0, float(k[4])))
+                except (TypeError, ValueError, IndexError):
+                    continue
+            if out:
+                return sorted(out)
     except Exception:
-        return []
+        pass
+    try:
+        r = requests.get(COINBASE_CANDLES_URL,
+                         params={'start': int(start_ts), 'end': int(end_ts),
+                                 'granularity': 60},
+                         timeout=timeout)
+        if r.status_code == 200:
+            out = []
+            for k in r.json() or []:
+                try:
+                    # [time_sec, low, high, open, close, volume], newest first.
+                    out.append((float(k[0]), float(k[4])))
+                except (TypeError, ValueError, IndexError):
+                    continue
+            if out:
+                return sorted(out)
+    except Exception:
+        pass
+    return []
 
 
 def btc_series_cached(slug: str, start_ts: float, end_ts: float,
@@ -159,6 +181,24 @@ def btc_close_at(rows: list, ts: float) -> Optional[float]:
         else:
             break
     return px
+
+
+def btc_rows_fresh(rows: list, now_ts: float,
+                   max_age_sec: float = 120.0) -> bool:
+    """True when the series covers recent time.
+
+    Guards against a frozen cache while the feed is down: a stale series
+    would pin the momentum move (silently sitting out, or entering on
+    stale momentum). Callers treat a stale/empty series as 'no BTC data',
+    never as 'no momentum'.
+    """
+    if not rows:
+        return False
+    try:
+        newest = max(float(t) for t, _ in rows)
+    except (TypeError, ValueError):
+        return False
+    return (now_ts - newest) <= max_age_sec
 
 
 def parse_json_objects(text: str) -> list[dict[str, Any]]:
@@ -1281,6 +1321,22 @@ def main():
                 m_open_ts = end_ts - 300.0 if end_ts else None
                 btc_rows = (btc_series_cached(slug, m_open_ts, time.time())
                             if m_open_ts else [])
+                if not btc_rows_fresh(btc_rows, time.time()):
+                    # No usable BTC history (feed down / geo-blocked / stale
+                    # cache). This is data absence, NOT flat momentum: count
+                    # it toward the error budget instead of resetting it.
+                    log_attempt(report, {
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'skip_no_btc_data',
+                        'seconds_left': sec_left,
+                    })
+                    err_streak += 1
+                    if error_budget_exceeded(err_streak, args.max_consecutive_errors):
+                        abort_run('aborted_consecutive_errors', 'aborted')
+                        return
+                    time.sleep(args.poll_sec)
+                    continue
                 btc_open_px = btc_close_at(btc_rows, m_open_ts) if m_open_ts else None
                 btc_now_px = btc_close_at(btc_rows, time.time())
                 if btc_now_px is None:

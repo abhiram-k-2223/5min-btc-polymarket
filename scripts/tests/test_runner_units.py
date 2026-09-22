@@ -378,6 +378,58 @@ class MomentumHelpersTest(unittest.TestCase):
         finally:
             r.requests.get = orig
 
+    def test_fetch_klines_falls_back_to_coinbase(self):
+        # Binance 451 (US geo-block) -> Coinbase candles, newest-first,
+        # parsed to ascending (epoch_sec, close).
+        class Blocked:
+            status_code = 451
+
+            def json(self):
+                return {"code": 0}
+
+        class Candles:
+            status_code = 200
+
+            def json(self):
+                return [[1700000060, 1.0, 2.0, 3.0, 97600.0, 9.0],
+                        ["bad-row"],
+                        [1700000000, 1.0, 2.0, 3.0, 97500.5, 9.0]]
+
+        def fake_get(url, *a, **k):
+            return Candles() if "coinbase" in url else Blocked()
+
+        orig = r.requests.get
+        r.requests.get = fake_get
+        try:
+            rows = r.fetch_btc_klines_1m(1700000000.0, 1700000120.0)
+        finally:
+            r.requests.get = orig
+        self.assertEqual(rows, [(1700000000.0, 97500.5),
+                               (1700000060.0, 97600.0)])
+
+    def test_fetch_klines_empty_when_both_fail(self):
+        class Bad:
+            status_code = 451
+
+            def json(self):
+                return {}
+
+        orig = r.requests.get
+        r.requests.get = lambda *a, **k: Bad()
+        try:
+            self.assertEqual(r.fetch_btc_klines_1m(1.0, 2.0), [])
+        finally:
+            r.requests.get = orig
+
+    def test_btc_rows_fresh(self):
+        self.assertFalse(r.btc_rows_fresh([], 1000.0))
+        self.assertFalse(r.btc_rows_fresh([(100.0, 90.0)], 1000.0))
+        self.assertTrue(r.btc_rows_fresh([(940.0, 90.0)], 1000.0))
+        # Unsorted input: newest row decides.
+        self.assertTrue(r.btc_rows_fresh([(100.0, 90.0), (990.0, 95.0)],
+                                         1000.0))
+        self.assertFalse(r.btc_rows_fresh([("bad", "row")], 1000.0))
+
     def test_btc_close_at(self):
         rows = [(100.0, 90.0), (160.0, 95.0), (220.0, 99.0)]
         self.assertIsNone(r.btc_close_at(rows, 50.0))
