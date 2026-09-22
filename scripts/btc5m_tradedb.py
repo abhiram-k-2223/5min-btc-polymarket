@@ -101,6 +101,41 @@ def record_close(
     con.commit()
 
 
+def settle_resolution(
+    con: _sqlite3.Connection,
+    trade_id: int,
+    *,
+    close_usdc: float,
+    pnl_usdc: float,
+    reason_suffix: str,
+) -> bool:
+    """Score a closed-but-unpriced trade from market resolution (#37).
+
+    Only touches rows whose pnl is still NULL (never overwrites a
+    recorded or manually-corrected PnL) and never rewrites closed_at.
+    Returns True when a row was updated.
+    """
+    cur = con.execute(
+        "UPDATE trades SET close_usdc=?, pnl_usdc=?,"
+        " close_reason=COALESCE(close_reason,'') || ?"
+        " WHERE id=? AND pnl_usdc IS NULL",
+        (close_usdc, pnl_usdc, reason_suffix, trade_id),
+    )
+    con.commit()
+    return cur.rowcount > 0
+
+
+def unscored_closed(con: _sqlite3.Connection) -> list[dict]:
+    """Closed trades still missing a PnL — settlement backfill candidates."""
+    con.row_factory = _sqlite3.Row
+    rows = con.execute(
+        "SELECT * FROM trades WHERE pnl_usdc IS NULL"
+        " AND closed_at IS NOT NULL AND market_slug IS NOT NULL"
+        " ORDER BY id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def recent(con: _sqlite3.Connection, limit: int = 20) -> list[dict]:
     con.row_factory = _sqlite3.Row
     rows = con.execute(

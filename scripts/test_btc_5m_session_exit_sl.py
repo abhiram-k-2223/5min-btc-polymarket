@@ -233,6 +233,107 @@ def parse_json_objects(text: str) -> list[dict[str, Any]]:
     return out
 
 
+RESOLUTION_FINAL_PRICE = 0.999
+
+
+def market_resolution(event: Optional[dict], side: str) -> tuple[bool, Optional[float]]:
+    """Score our side from a Gamma event once resolution is final (#37).
+
+    Returns (is_final, price_for_our_side). Final means the first market
+    is closed and some outcome prints >= 0.999 — the same finality gate
+    as the paper shim's settlement leg. Anything else (open market,
+    unfinal prices, unknown shape) returns (False, None): callers must
+    not score, and must keep waiting or leave the row for later.
+    """
+    try:
+        mkts = (event or {}).get('markets') or []
+        m = mkts[0] if mkts else {}
+        if m.get('closed') is not True:
+            return False, None
+        outcomes = parse_json_field(m.get('outcomes')) or []
+        prices = parse_json_field(m.get('outcomePrices')) or []
+        nums: list[float] = []
+        for p in prices:
+            try:
+                nums.append(float(p))
+            except (TypeError, ValueError):
+                return False, None
+        if not nums or max(nums) < RESOLUTION_FINAL_PRICE:
+            return False, None
+        want = 'up' if str(side or '').strip().upper() == 'UP' else 'down'
+        labs = [str(x).lower() for x in outcomes]
+        if want not in labs or len(labs) != len(nums):
+            return False, None
+        return True, nums[labs.index(want)]
+    except Exception:
+        return False, None
+
+
+def settle_unscored_trades(runtime_dir: str, fetch=None) -> dict:
+    """Score closed-but-unpriced trades from Gamma resolution (#37).
+
+    UMA finalizes minutes after a 5m market ends — after the trading
+    session is over — so in-session settlement can never fire. This
+    runs at session startup instead. Idempotent: only NULL-pnl rows are
+    touched (recorded and manually-corrected PnLs are never
+    overwritten), and closed_at is never rewritten. Best-effort:
+    per-market failures only log. Returns a summary for the report.
+    """
+    summary: dict[str, Any] = {'checked': 0, 'settled': [],
+                               'unresolved': [], 'errors': []}
+    if fetch is None:
+        fetch = fetch_event
+    try:
+        con = tradedb.connect(runtime_dir)
+    except Exception as e:
+        summary['errors'].append(f'db: {e}')
+        return summary
+    try:
+        cands = tradedb.unscored_closed(con)
+    except Exception as e:
+        summary['errors'].append(f'query: {e}')
+        con.close()
+        return summary
+    summary['checked'] = len(cands)
+    for t in cands:
+        slug = t.get('market_slug')
+        try:
+            ev = fetch(slug)
+        except Exception as e:
+            summary['errors'].append(f'{slug}: fetch: {e}')
+            continue
+        final, px = market_resolution(ev, t.get('side'))
+        if not final or px is None:
+            summary['unresolved'].append(slug)
+            continue
+        shares = float(t.get('shares') or 0)
+        cost = float(t.get('cost_usdc') or 0)
+        close_usdc = round(shares * float(px), 6)
+        pnl = round(close_usdc - cost, 6)
+        tag = f"+resolution_backfill_{str(t.get('side') or '').lower()}"
+        try:
+            if tradedb.settle_resolution(con, int(t['id']),
+                                         close_usdc=close_usdc, pnl_usdc=pnl,
+                                         reason_suffix=tag):
+                summary['settled'].append({'id': t['id'],
+                                           'market_slug': slug,
+                                           'close_usdc': close_usdc,
+                                           'pnl_usdc': pnl})
+                try:
+                    alerts.emit(runtime_dir, 'settle',
+                                {'trade_id': t['id'], 'market_slug': slug,
+                                 'close_usdc': close_usdc, 'pnl_usdc': pnl},
+                                None)
+                except Exception:
+                    pass
+            else:
+                summary['unresolved'].append(f'{slug}: already-scored')
+        except Exception as e:
+            summary['errors'].append(f'{slug}: settle: {e}')
+    con.close()
+    return summary
+
+
 def bucket_5m(ts: int) -> int:
     return ts - (ts % 300)
 
@@ -862,6 +963,11 @@ PROFILES: dict[str, dict[str, Any]] = {
         # against strong crowd flow (#1, #2, #3).
         'btc_move_usd_min': 70.0,
         'skew_veto_threshold': 0.10,
+        # Post-market resolution wait: UMA finalizes minutes after the
+        # window ends, so a failed CLOB exit lingers this long polling
+        # Gamma before the session gives up (the next session's startup
+        # backfill scores whatever is still unresolved; #37).
+        'post_market_wait_sec': 300,
     },
     # Aggressive: higher frequency (lower threshold, looser guards) and
     # higher risk (15% of equity, capped at $15) (#10, #11).
@@ -893,6 +999,8 @@ PROFILES: dict[str, dict[str, Any]] = {
         # the skew veto tolerates more disagreement (#1, #2, #3).
         'btc_move_usd_min': 50.0,
         'skew_veto_threshold': 0.15,
+        # Same post-market resolution wait as conservative (#37).
+        'post_market_wait_sec': 300,
     },
 }
 
@@ -929,6 +1037,7 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
         ('hedge_max_notional_usd', float),
         ('btc_move_usd_min', float),
         ('skew_veto_threshold', float),
+        ('post_market_wait_sec', int),
     ):
         _apply_profile_value(args, name, cast)
     if getattr(args, 'disable_momentum', False):
@@ -1140,6 +1249,8 @@ def main():
     ap.add_argument('--btc-move-usd-min', type=float, default=None, help='Min |BTC move| since market open to allow entry; side follows the move (default: 70 conservative, 50 aggressive; #1, #3)')
     ap.add_argument('--skew-veto-threshold', type=float, default=None, help='Veto entry when skew opposes momentum beyond this (default: 0.10 conservative, 0.15 aggressive; #2)')
     ap.add_argument('--disable-momentum', action='store_true', help='Restore the legacy highest-ask entry trigger (comparison runs only; #3)')
+    ap.add_argument('--post-market-wait-sec', type=int, default=None, help='After a failed CLOB exit, poll Gamma for resolution up to this long before giving up (default: 300; #37)')
+    ap.add_argument('--disable-settle-backfill', action='store_true', help='Skip the startup backfill that scores closed-but-unpriced trades from Gamma resolution (#37)')
     ap.add_argument('--candidate-slots', default='prev,current,next,next2', help='Comma-separated slot scan list; the entry loop picks the closest slot with a tradeable market (mirrors YAML candidate_slots; #17)')
     ap.add_argument('--hedge-trigger-seconds-left', type=int, default=None, help='... and at most this many seconds remain (default: 45 conservative, 50 aggressive)')
     ap.add_argument('--hedge-share-pct', type=float, default=None, help='Hedge notional as pct of main cost (default: 3 conservative, 5 aggressive)')
@@ -1174,6 +1285,18 @@ def main():
     # Micro-hedge master switch (#13): profiles default it on; only an
     # explicit --disable-hedge turns it off.
     hedge_enabled = not args.disable_hedge
+    # Settlement backfill (#37): score closed-but-unpriced trades from
+    # Gamma resolution at startup — UMA finalizes after sessions end.
+    if args.disable_settle_backfill:
+        report_settled: dict[str, Any] = {'checked': 0, 'settled': [],
+                                          'unresolved': [], 'errors': [],
+                                          'disabled': True}
+    else:
+        try:
+            report_settled = settle_unscored_trades(args.runtime_dir)
+        except Exception as e:
+            report_settled = {'checked': 0, 'settled': [],
+                              'unresolved': [], 'errors': [f'backfill: {e}']}
 
     report: dict[str, Any] = {
         'started_at': ts_utc(),
@@ -1215,9 +1338,12 @@ def main():
             'skew_veto_threshold': args.skew_veto_threshold,
             'disable_momentum': args.disable_momentum,
             'candidate_slots': args.candidate_slots,
+            'post_market_wait_sec': args.post_market_wait_sec,
+            'settle_backfill': not args.disable_settle_backfill,
         },
         'attempts': [],
         'attempts_dropped': 0,
+        'settled_backfill': report_settled,
     }
 
     deadline = time.time() + args.entry_timeout_min * 60
@@ -1646,9 +1772,12 @@ def main():
     report['stop_loss_price'] = sl_price
 
     close_reason = None
+    # Clock-based exit (#37): the exit timestamp is fixed at entry so the
+    # loop wakes exactly on it instead of drifting on poll boundaries.
+    exit_ts = end_ts - args.exit_before_sec
     while not _shutdown_requested:
         now = time.time()
-        if now >= (end_ts - args.exit_before_sec):
+        if now >= exit_ts:
             close_reason = f'time_exit_{args.exit_before_sec}s_before_end'
             break
 
@@ -1670,7 +1799,9 @@ def main():
         # certain late in the slot, buy a small opposite-side position as
         # tail-risk insurance. Fire-once per run; placement uses the same
         # run_open path as the main entry, and any failure only logs.
-        if hedge_triggered(
+        # Skipped inside the final poll window (#37): starting slow
+        # subprocess work there would push the exit past its timestamp.
+        if (exit_ts - now) > args.poll_sec and hedge_triggered(
             side_px,
             (end_ts - now) if end_ts else None,
             trigger_price=args.hedge_trigger_price,
@@ -1734,7 +1865,10 @@ def main():
             except Exception as e:
                 log_attempt(report, {'ts': ts_utc(), 'status': 'hedge_error',
                                      'error': str(e)})
-        time.sleep(args.poll_sec)
+        # Wake exactly on the exit timestamp when it falls inside the
+        # next poll window (#37); worst-case trigger slip is one slow
+        # iteration instead of a full poll period.
+        time.sleep(min(args.poll_sec, max(0.0, exit_ts - time.time())))
 
     # SIGTERM/SIGINT during monitoring still runs the close cascade below
     # with this reason (#14) instead of orphaning the position.
@@ -1835,6 +1969,63 @@ def main():
     report['realized_cashflow_pnl_usdc'] = pnl
     report['hedge_pnl_usdc'] = (round(hedge_close_usdc - hedge_cost_usdc, 6)
                                 if hedge_closed else None)
+    # Post-market resolution wait (#37): a failed CLOB exit is not the
+    # end — UMA finalizes minutes after the window ends, while the
+    # session is still alive. Poll Gamma up to post_market_wait_sec;
+    # on finality, score the trade now instead of leaving it NULL for
+    # the next session's startup backfill. Combined economics mirror
+    # the main-leg formula above.
+    if (not closed['close_success'] and not close_usdc
+            and opened.get('trade_db_id') is not None
+            and args.post_market_wait_sec
+            and args.post_market_wait_sec > 0):
+        _wait_until = time.time() + args.post_market_wait_sec
+        while time.time() < _wait_until and not _shutdown_requested:
+            try:
+                _ev = fetch_event(opened['market_slug'])
+            except Exception:
+                _ev = None
+            _final, _px = market_resolution(_ev, opened.get('side'))
+            if _final and _px is not None:
+                _settle_usdc = round(float(opened.get('shares') or 0)
+                                     * float(_px), 6)
+                _settle_pnl = round(_settle_usdc + hedge_close_usdc
+                                    - float(opened.get('cost_usdc') or 0)
+                                    - hedge_cost_usdc, 6)
+                try:
+                    _con2 = tradedb.connect(args.runtime_dir)
+                    if tradedb.settle_resolution(
+                            _con2, int(opened['trade_db_id']),
+                            close_usdc=_settle_usdc, pnl_usdc=_settle_pnl,
+                            reason_suffix='+resolution_settle_'
+                            + str(opened.get('side') or '').lower()):
+                        closed['close_usdc'] = _settle_usdc
+                        closed['close_success'] = True
+                        closed['close_status'] = 'resolved'
+                        pnl = _settle_pnl
+                        report['realized_cashflow_pnl_usdc'] = pnl
+                        report['post_market_settle'] = {
+                            'close_usdc': _settle_usdc,
+                            'pnl_usdc': _settle_pnl}
+                        log_attempt(report, {'ts': ts_utc(),
+                                             'status': 'resolved_settle',
+                                             'close_usdc': _settle_usdc,
+                                             'pnl_usdc': _settle_pnl})
+                        try:
+                            alerts.emit(
+                                args.runtime_dir, 'settle',
+                                {'trade_id': opened.get('trade_db_id'),
+                                 'market_slug': opened.get('market_slug'),
+                                 'close_usdc': _settle_usdc,
+                                 'pnl_usdc': _settle_pnl},
+                                args.alert_webhook_url)
+                        except Exception:
+                            pass
+                    _con2.close()
+                except Exception as e:
+                    report['settle_warn'] = str(e)
+                break
+            time.sleep(min(20.0, max(1.0, _wait_until - time.time())))
     if ledger_file is not None:
         _ledger = load_ledger(ledger_file, utc_today())
         record_close(_ledger, pnl)

@@ -688,5 +688,117 @@ class SlotScanTest(unittest.TestCase):
         self.assertEqual(mm["_slot"], "next")
 
 
+class MarketResolutionTest(unittest.TestCase):
+    """Gamma resolution scoring gate (#37)."""
+
+    def _ev(self, prices, closed=True):
+        return {"markets": [{"closed": closed,
+                             "outcomes": ["Up", "Down"],
+                             "outcomePrices": prices}]}
+
+    def test_itm_side_scores_full(self):
+        # Real 2026-09-22 shape: prices arrive as JSON strings.
+        final, px = r.market_resolution(self._ev('["0", "1"]'), "DOWN")
+        self.assertTrue(final)
+        self.assertEqual(px, 1.0)
+
+    def test_otm_side_scores_zero_but_final(self):
+        final, px = r.market_resolution(self._ev('["0", "1"]'), "up")
+        self.assertTrue(final)
+        self.assertEqual(px, 0.0)
+
+    def test_list_form_prices(self):
+        final, px = r.market_resolution(self._ev([0.0, 1.0]), "DOWN")
+        self.assertTrue(final)
+        self.assertEqual(px, 1.0)
+
+    def test_open_market_not_final(self):
+        self.assertEqual(r.market_resolution(self._ev('["0", "1"]',
+                                                      closed=False), "DOWN"),
+                         (False, None))
+
+    def test_unfinal_prices_not_final(self):
+        self.assertEqual(r.market_resolution(self._ev('["0.6", "0.4"]'),
+                                             "DOWN"),
+                         (False, None))
+
+    def test_bad_shapes_never_raise(self):
+        for ev in (None, {}, {"markets": []}, {"markets": [{}]},
+                   self._ev('["x", "1"]'), self._ev('["1"]')):
+            self.assertEqual(r.market_resolution(ev, "DOWN"), (False, None))
+
+
+class SettleBackfillTest(unittest.TestCase):
+    """Startup settlement backfill over the trade DB (#37)."""
+
+    def _db(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        con = r.tradedb.connect(d)
+        return d, con
+
+    def _seed(self, con, close_reason="time_exit", close_usdc=None,
+              pnl_usdc=None, **kw):
+        base = dict(mode="dry", market_slug="s", side="DOWN",
+                    entry_price=0.98, shares=8.0, cost_usdc=8.0)
+        base.update(kw)
+        tid = r.tradedb.record_open(con, **base)
+        r.tradedb.record_close(con, tid, close_reason=close_reason,
+                               close_usdc=close_usdc, pnl_usdc=pnl_usdc)
+        return tid
+
+    def test_settles_unscored_and_skips_rest(self):
+        import os
+        os.environ.pop("BTC5M_ALERT_WEBHOOK", None)
+        d, con = self._db()
+        t1 = self._seed(con, market_slug="m-itm")
+        t2 = self._seed(con, market_slug="m-open")
+        t3 = self._seed(con, market_slug="m-scored", close_usdc=1.0,
+                        pnl_usdc=-7.0)
+        con.close()
+
+        def fetch(slug):
+            if slug == "m-itm":
+                return {"markets": [{"closed": True, "outcomes": ["Up", "Down"],
+                                     "outcomePrices": ["0", "1"]}]}
+            return {"markets": [{"closed": False, "outcomes": ["Up", "Down"],
+                                 "outcomePrices": ["0.5", "0.5"]}]}
+
+        summary = r.settle_unscored_trades(d, fetch=fetch)
+        self.assertEqual(summary["checked"], 2)  # t3 already scored
+        self.assertEqual(len(summary["settled"]), 1)
+        self.assertEqual(summary["settled"][0]["id"], t1)
+        self.assertEqual(summary["settled"][0]["pnl_usdc"], 0.0)  # 8*1-8
+        self.assertEqual(summary["unresolved"], ["m-open"])
+
+        con = r.tradedb.connect(d)
+        rows = {t["id"]: t for t in r.tradedb.recent(con, 10)}
+        self.assertEqual(rows[t1]["close_usdc"], 8.0)
+        self.assertIn("resolution_backfill_down", rows[t1]["close_reason"])
+        self.assertEqual(rows[t3]["pnl_usdc"], -7.0)  # untouched
+        con.close()
+
+    def test_fetch_error_logged_not_raised(self):
+        import os
+        os.environ.pop("BTC5M_ALERT_WEBHOOK", None)
+        d, con = self._db()
+        self._seed(con, market_slug="m-boom")
+        con.close()
+
+        def boom(slug):
+            raise IOError("gamma down")
+
+        summary = r.settle_unscored_trades(d, fetch=boom)
+        self.assertEqual(summary["checked"], 1)
+        self.assertEqual(summary["settled"], [])
+        self.assertTrue(summary["errors"])
+
+    def test_profile_default_wait(self):
+        self.assertEqual(r.PROFILES["conservative"]["post_market_wait_sec"],
+                         300)
+        self.assertEqual(r.PROFILES["aggressive"]["post_market_wait_sec"],
+                         300)
+
+
 if __name__ == "__main__":
     unittest.main()
