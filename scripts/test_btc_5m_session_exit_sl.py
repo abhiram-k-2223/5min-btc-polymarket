@@ -236,6 +236,22 @@ def parse_json_objects(text: str) -> list[dict[str, Any]]:
 RESOLUTION_FINAL_PRICE = 0.999
 
 
+def linger_settle_result(close_reason, side,
+                         settle_usdc: float,
+                         settle_pnl: float) -> tuple:
+    """Synced close locals after a successful post-market linger settle.
+
+    The linger block updates the ``closed`` dict and ``pnl`` in place,
+    but the ``record_close()`` call and close alert below reuse the
+    outer ``close_usdc``/``close_reason`` locals — stale values used to
+    clobber the settled row back to NULL with an untagged reason (#42).
+    """
+    return (settle_usdc,
+            str(close_reason or '') + '+resolution_settle_'
+            + str(side or '').lower(),
+            settle_pnl)
+
+
 def market_resolution(event: Optional[dict], side: str) -> tuple[bool, Optional[float]]:
     """Score our side from a Gamma event once resolution is final (#37).
 
@@ -1088,6 +1104,25 @@ def resolve_stake_usd(args: argparse.Namespace) -> tuple[float, str]:
     return max(MIN_STAKE_USD, auto), 'equity_pct'
 
 
+def execute_bankroll_error(args: argparse.Namespace, argv: list) -> Optional[str]:
+    """Refuse live execution on placeholder sizing (#41).
+
+    ``--execute`` is only meaningful with deliberate bankroll inputs —
+    an explicit ``--equity-usd``/``--stake-usd``/``--max-notional-usd``
+    flag on the command line. Paper runs (no ``--execute``) are always
+    allowed. Returns an error string, or None when execution may proceed.
+    """
+    if not getattr(args, 'execute', False):
+        return None
+    argv = list(argv or [])
+    if any(a == f or a.startswith(f + '=') for a in argv
+           for f in ('--equity-usd', '--stake-usd', '--max-notional-usd')):
+        return None
+    return ("--execute requires explicit bankroll sizing (--equity-usd, "
+            "--stake-usd, or --max-notional-usd); refusing to run live "
+            "on placeholder defaults")
+
+
 # Graceful shutdown (#14). First SIGTERM/SIGINT sets the flag so the entry
 # loop stops looking, the monitor loop breaks out, and the normal close
 # cascade still runs. A second signal forces immediate exit.
@@ -1279,6 +1314,11 @@ def main():
         ap.error(_repo_err)
     # Per-trade stake: explicit --stake-usd wins, else equity-derived (#11).
     stake_usd, stake_basis = resolve_stake_usd(args)
+    # Bankroll policy gate (#41): --execute on placeholder sizing is a
+    # refusal, not a warning — live stakes must be deliberate.
+    _bankroll_err = execute_bankroll_error(args, sys.argv)
+    if _bankroll_err is not None:
+        ap.error(_bankroll_err)
     # Graceful shutdown (#14): SIGTERM/SIGINT finish the run via the close
     # cascade instead of orphaning the position.
     install_signal_handlers()
@@ -2003,6 +2043,13 @@ def main():
                         closed['close_success'] = True
                         closed['close_status'] = 'resolved'
                         pnl = _settle_pnl
+                        # #42: sync the outer locals too — the record_close()
+                        # call and close alert below reuse them, and stale
+                        # values used to clobber the settled row back to
+                        # close_usdc NULL with an untagged reason.
+                        close_usdc, close_reason, pnl = linger_settle_result(
+                            close_reason, opened.get('side'),
+                            _settle_usdc, _settle_pnl)
                         report['realized_cashflow_pnl_usdc'] = pnl
                         report['post_market_settle'] = {
                             'close_usdc': _settle_usdc,

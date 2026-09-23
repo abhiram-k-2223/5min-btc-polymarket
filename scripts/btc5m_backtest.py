@@ -133,6 +133,76 @@ def fetch_closed_markets(start_ts: float, end_ts: float,
     return sorted(seen.values(), key=lambda m: m["end_ts"])
 
 
+def resolve_event_winner(event: dict):
+    """Winner side ('up'/'dn') from a Gamma event, or None if not final.
+
+    Fires only when some outcome price >= 0.999 (UMA-finalized), mirroring
+    the runner's market_resolution() gate.
+    """
+    for m in event.get("markets") or []:
+        outcomes = m.get("outcomes") or []
+        prices = m.get("outcomePrices") or []
+        if isinstance(outcomes, str):
+            try:
+                outcomes = _json.loads(outcomes)
+            except ValueError:
+                continue
+        if isinstance(prices, str):
+            try:
+                prices = _json.loads(prices)
+            except ValueError:
+                continue
+        try:
+            vals = [float(p) for p in prices]
+        except (TypeError, ValueError):
+            continue
+        if len(outcomes) == len(vals) and vals and max(vals) >= 0.999:
+            name = str(outcomes[vals.index(max(vals))]).strip().lower()
+            if name.startswith("up"):
+                return "up"
+            if name.startswith("down"):
+                return "dn"
+    return None
+
+
+def fetch_resolutions(slugs: list[str], workers: int = 8) -> dict:
+    """Winner per market slug via Gamma (ground truth for hold-to-resolution).
+
+    Returns {slug: 'up'/'dn'/None}. Missing/unfinalized markets map to None
+    and are excluded from hold-mode metrics (kept as end_of_data).
+    """
+    import urllib.parse as _up
+    import urllib.request as _ur
+    import urllib.error as _uer
+    import time as _time
+    import concurrent.futures as _cf
+
+    def one(slug: str):
+        qs = _up.urlencode({"slug": slug})
+        req = _ur.Request(f"{GAMMA_EVENTS_URL}?{qs}",
+                          headers={"User-Agent": "btc5m-backtest/1.0"})
+        for attempt in range(4):
+            try:
+                with _ur.urlopen(req, timeout=30) as resp:
+                    events = _json.loads(resp.read().decode("utf-8"))
+                break
+            except (_uer.URLError, ConnectionError, TimeoutError):
+                _time.sleep(2.0 * (attempt + 1))
+        else:
+            return slug, None
+        evs = events if isinstance(events, list) else [events]
+        for ev in evs:
+            if isinstance(ev, dict) and ev.get("slug") == slug:
+                return slug, resolve_event_winner(ev)
+        return slug, None
+
+    out: dict = {}
+    with _cf.ThreadPoolExecutor(max_workers=workers) as pool:
+        for slug, winner in pool.map(one, slugs):
+            out[slug] = winner
+    return out
+
+
 def fetch_hour_markets(hour: str, markets: list[dict], out_dir: str) -> dict:
     """One DuckDB query per hour for many markets; split rows per market.
 
@@ -378,6 +448,15 @@ def replay(snapshots, params: dict) -> dict:
     if momentum_mode and btc_open is None and btc_series:
         btc_open = btc_series[0]["close"]
 
+    # Exit regime (#39): 'exit' = book exit at exit_before_sec (status quo);
+    # 'stop_redeem' = stop-loss on the book, otherwise hold to UMA
+    # redemption (de-facto live behavior when makers pull quotes);
+    # 'hold' = pure hold to redemption, no stop (upper-bound arm).
+    # Redemption needs the ground-truth winner via params['resolution']
+    # ('up'/'dn'/None); unknown -> end_of_data, excluded from metrics.
+    hold_mode = params.get("hold_mode", "exit")
+    resolution = params.get("resolution")
+
     by_side = {"up": [], "dn": []}
     for s in snapshots:
         if s.get("side") in by_side:
@@ -463,9 +542,13 @@ def replay(snapshots, params: dict) -> dict:
         else:
             top = latest[in_pos["side"]]
             bid = top["best_bid"]
+            if hold_mode in ("stop_redeem", "hold") and now >= exit_ts:
+                # Hold through the book-exit point: ride to redemption.
+                # (stop_redeem still allows the stop-loss below to fire.)
+                continue
             if now >= exit_ts:
                 reason = "time_exit"
-            elif bid is not None and bid <= in_pos["sl_price"]:
+            elif hold_mode != "hold" and bid is not None and bid <= in_pos["sl_price"]:
                 reason = "stop_loss"
             else:
                 continue
@@ -482,7 +565,20 @@ def replay(snapshots, params: dict) -> dict:
             })
             in_pos = None
 
-    # Dangling position at end of data: mark-to-last-bid, flagged.
+    # Dangling position at end of data: redemption settlement when the
+    # winner is known (#39), else mark-to-last-bid, flagged and excluded.
+    if in_pos is not None:
+        if hold_mode in ("stop_redeem", "hold") and resolution in ("up", "dn"):
+            px = 1.0 if in_pos["side"] == resolution else 0.0
+            trades.append({
+                "side": in_pos["side"], "entry_ts": in_pos["entry_ts"],
+                "exit_ts": end_ts,
+                "entry_price": round(in_pos["entry_price"], 4),
+                "exit_price": px, "exit_reason": "resolution",
+                "pnl_usdc": round(in_pos["shares"] * px - in_pos["cost"], 4),
+                "btc_move_usd_at_entry": in_pos.get("btc_move_usd_at_entry"),
+            })
+            in_pos = None
     if in_pos is not None:
         top = latest[in_pos["side"]]
         bid = top["best_bid"] or 0.0
@@ -529,14 +625,16 @@ def load_snapshots(path: str) -> list[dict]:
 
 
 def bulk_replay(markets: list[dict], snaps_dir: str, btc_series: list[dict],
-                params: dict) -> dict:
+                params: dict, resolutions: dict | None = None) -> dict:
     """Replay every market with snapshots; aggregate expectancy stats.
 
     Markets with no snapshot file are counted as ``missing_data``, not as
-    no-trade markets. Returns per-market rows + aggregate metrics.
+    no-trade markets. ``resolutions`` maps slug -> 'up'/'dn'/None for
+    hold-mode arms (#39). Returns per-market rows + aggregate metrics.
     """
     rows = []
     all_pnls = []
+    resolutions = resolutions or {}
     for m in markets:
         path = _os.path.join(snaps_dir, f"{m['slug']}.jsonl")
         if not _os.path.exists(path):
@@ -551,6 +649,7 @@ def bulk_replay(markets: list[dict], snaps_dir: str, btc_series: list[dict],
         p = dict(params)
         p["market_end_ts"] = m["end_ts"]
         p["btc_series"] = btc_series
+        p["resolution"] = resolutions.get(m["slug"])
         res = replay(snaps, p)
         for t in res["trades"]:
             if t["exit_reason"] != "end_of_data":
@@ -601,6 +700,7 @@ def _replay_params_from_args(args) -> dict:
         "fill_slippage_usd": args.fill_slippage_usd,
         "btc_move_usd_min": args.btc_move_usd_min,
         "skew_veto_threshold": args.skew_veto_threshold,
+        "hold_mode": args.hold_mode,
     }
 
 
@@ -621,6 +721,10 @@ def _add_strategy_args(p) -> None:
                    help="Min |BTC move| since market open to allow entry (#1)")
     p.add_argument("--skew-veto-threshold", type=float, default=0.10,
                    help="Veto entry when skew opposes momentum beyond this (#2)")
+    p.add_argument("--hold-mode", default="exit",
+                   choices=["exit", "stop_redeem", "hold"],
+                   help="exit=book exit at exit_before_sec; stop_redeem=stop-loss "
+                        "live, else hold to UMA redemption; hold=pure hold (#39)")
 
 
 def main() -> None:
@@ -655,7 +759,13 @@ def main() -> None:
     p_br.add_argument("--markets", required=True)
     p_br.add_argument("--snaps-dir", required=True)
     p_br.add_argument("--out", required=True, help="Aggregate JSON output path")
+    p_br.add_argument("--resolutions", default=None,
+                      help="JSON {slug: up/dn/null} from 'resolutions' (#39)")
     _add_strategy_args(p_br)
+
+    p_res = sub.add_parser("resolutions", help="Fetch winners (Gamma)")
+    p_res.add_argument("--markets", required=True, help="markets JSON from 'markets'")
+    p_res.add_argument("--out", required=True)
 
     p_b = sub.add_parser("fetch-btc", help="Export 1m BTC closes (Binance)")
     p_b.add_argument("--start", required=True, help="ISO UTC range start")
@@ -707,12 +817,27 @@ def main() -> None:
         with open(args.markets, encoding="utf-8") as fh:
             ms = _json.load(fh)
         btc = load_btc_series(args.btc_series) if args.btc_series else []
+        res_map = {}
+        if args.resolutions:
+            with open(args.resolutions, encoding="utf-8") as fh:
+                res_map = _json.load(fh)
         params = _replay_params_from_args(args)
-        agg = bulk_replay(ms, args.snaps_dir, btc, params)
+        agg = bulk_replay(ms, args.snaps_dir, btc, params, res_map)
         _os.makedirs(_os.path.dirname(_os.path.abspath(args.out)), exist_ok=True)
         with open(args.out, "w", encoding="utf-8") as fh:
             _json.dump(agg, fh, indent=2)
         print(_json.dumps(agg["aggregate"], indent=2))
+        return
+
+    if args.cmd == "resolutions":
+        with open(args.markets, encoding="utf-8") as fh:
+            ms = _json.load(fh)
+        res_map = fetch_resolutions([m["slug"] for m in ms])
+        _os.makedirs(_os.path.dirname(_os.path.abspath(args.out)), exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as fh:
+            _json.dump(res_map, fh, indent=2)
+        known = sum(1 for v in res_map.values() if v in ("up", "dn"))
+        print(f"resolved {known}/{len(res_map)} markets -> {args.out}")
         return
 
     snaps = load_snapshots(args.snapshots)

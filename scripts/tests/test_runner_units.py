@@ -187,6 +187,32 @@ class StakeResolutionTest(unittest.TestCase):
                                                 max_notional_usd=None))
         self.assertEqual(stake, r.MIN_STAKE_USD)
 
+    def test_execute_gate(self):
+        # #41: paper always allowed; --execute needs an explicit
+        # bankroll flag on the command line.
+        paper = argparse.Namespace(execute=False)
+        self.assertIsNone(r.execute_bankroll_error(paper, ['run', '--execute']))
+        live = argparse.Namespace(execute=True)
+        err = r.execute_bankroll_error(live, ['run', '--execute'])
+        self.assertIsNotNone(err)
+        self.assertIn('--equity-usd', err)
+        for flag in ('--equity-usd', '--stake-usd', '--max-notional-usd'):
+            self.assertIsNone(
+                r.execute_bankroll_error(live, ['run', f'{flag}=100']))
+            self.assertIsNone(
+                r.execute_bankroll_error(live, ['run', flag, '100']))
+
+    def test_linger_settle_result(self):
+        # #42: settled triple carries proceeds, tagged reason, pnl.
+        usdc, reason, pnl = r.linger_settle_result(
+            'time_exit_40s_before_end', 'UP', 9.41, 1.41)
+        self.assertEqual(usdc, 9.41)
+        self.assertEqual(reason,
+                         'time_exit_40s_before_end+resolution_settle_up')
+        self.assertEqual(pnl, 1.41)
+        _, reason_none, _ = r.linger_settle_result(None, None, 8.0, 0.0)
+        self.assertEqual(reason_none, '+resolution_settle_')
+
 
 class ExitAndHedgeTest(unittest.TestCase):
     """Proportional force-close (#12), micro-hedge sizing/trigger (#13),

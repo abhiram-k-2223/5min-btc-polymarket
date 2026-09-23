@@ -7,6 +7,7 @@ of truth for trade history. Lives at <runtime>/btc5m_trades.sqlite.
 Usage:
     python scripts/btc5m_tradedb.py recent --runtime-dir runtime --limit 10
     python scripts/btc5m_tradedb.py summary --runtime-dir runtime --days 7
+    python scripts/btc5m_tradedb.py exits --runtime-dir runtime --limit 50
 """
 from __future__ import annotations
 
@@ -157,6 +158,40 @@ def daily_summary(con: _sqlite3.Connection, days: int = 7) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def exit_mix(con: _sqlite3.Connection, limit: int = 50) -> dict:
+    """Book-vs-redemption exit mix over trailing closed trades (#39a).
+
+    book = proceeds recorded without any resolution/settle tag (a real
+    CLOB fill, including stop-losses); redemption = scored via UMA
+    settlement (tagged reason, or pnl present with no book proceeds —
+    the legacy linger-settle shape); unscored = still NULL. A regime
+    shift in either direction shows up here first.
+    """
+    con.row_factory = _sqlite3.Row
+    rows = con.execute(
+        "SELECT close_reason, close_usdc, pnl_usdc FROM trades"
+        " WHERE closed_at IS NOT NULL ORDER BY id DESC LIMIT ?",
+        (int(limit),),
+    ).fetchall()
+    mix = {'n': 0, 'book': 0, 'redemption': 0, 'unscored': 0, 'stops': 0}
+    for r in rows:
+        mix['n'] += 1
+        reason = str(r['close_reason'] or '')
+        if r['pnl_usdc'] is None:
+            mix['unscored'] += 1
+        elif (r['close_usdc'] is not None
+                and 'resolution' not in reason and 'settle' not in reason):
+            mix['book'] += 1
+            if 'stop_loss' in reason:
+                mix['stops'] += 1
+        else:
+            mix['redemption'] += 1
+    scored = mix['book'] + mix['redemption']
+    mix['book_fill_rate'] = (round(mix['book'] / scored, 4)
+                             if scored else None)
+    return mix
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Query the BTC 5m trade ledger")
     ap.add_argument("--runtime-dir", default=None,
@@ -168,6 +203,9 @@ def main() -> None:
     p_sum = sub.add_parser("summary", help="Per-day PnL summary")
     p_sum.add_argument("--days", type=int, default=7)
     p_sum.add_argument("--runtime-dir", default=None)
+    p_exits = sub.add_parser("exits", help="Book-vs-redemption exit mix")
+    p_exits.add_argument("--limit", type=int, default=50)
+    p_exits.add_argument("--runtime-dir", default=None)
     args = ap.parse_args()
 
     runtime_dir = args.runtime_dir or _os.path.join(
@@ -181,6 +219,11 @@ def main() -> None:
                   f"exit={t['close_reason']} pnl={t['pnl_usdc']}")
         if not rows:
             print("no trades recorded")
+    elif args.cmd == "exits":
+        m = exit_mix(con, args.limit)
+        print(f"trailing={m['n']} book={m['book']} (stops={m['stops']}) "
+              f"redemption={m['redemption']} unscored={m['unscored']} "
+              f"book_fill_rate={m['book_fill_rate']}")
     else:
         rows = daily_summary(con, args.days)
         for s in rows:

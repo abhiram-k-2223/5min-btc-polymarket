@@ -6,7 +6,7 @@ Repository: https://github.com/Novals83/5min-btc-polymarket
 
 ## Recent Fixes
 A repo audit surfaced ~30 execution, risk, and ops gaps; the following are
-now fixed and covered by 119 unit tests (`scripts/tests/`):
+now fixed and covered by 129 unit tests (`scripts/tests/`):
 - Daily loss cap + max trades/day enforced via a JSON risk ledger (live trades only)
 - Pre-entry spread / liquidity / quote-staleness gates on the CLOB book
 - Consecutive-error abort, and a machine-readable `decision` field the watcher stops on
@@ -20,9 +20,20 @@ now fixed and covered by 119 unit tests (`scripts/tests/`):
 - Momentum entry matching the documented strategy: side follows the BTC move since market open (Binance 1m klines, `--btc-move-usd-min` 70/50), threshold is a price floor, skew veto blocks entries against crowd flow (`--skew-veto-threshold` 0.10/0.15); `--disable-momentum` restores the legacy trigger
 - Bookless exits settle at resolution: time exit moved to 40s before end (makers pull 5m quotes in the final seconds), and when the book is gone the paper shim credits the resolved $/share instead of $0; every close-debug row carries the failure reason
 - Resolution settlement that survives the session: UMA finalizes minutes after the window ends, so a failed exit now lingers up to 300s polling Gamma (`--post-market-wait-sec`), and every session startup backfills still-unscored trades from resolution (`--disable-settle-backfill` opts out); the monitor loop wakes exactly on the clock-fixed exit timestamp instead of drifting on poll boundaries
+- Exit-mix accounting (`python scripts/btc5m_tradedb.py exits`): book fills vs resolution redemptions vs unscored over trailing closed trades, with `book_fill_rate` — a regime shift in either direction shows up here first; linger settlement syncs the close locals so settled rows are never clobbered back to NULL
+- Live-execution guardrail: `--execute` refuses to run on placeholder sizing and requires an explicit `--equity-usd`, `--stake-usd`, or `--max-notional-usd` flag
 
 More problems from the audit are still being worked through — strategy edges,
 order-book depth modeling, and remaining ops items. Contributions welcome.
+
+## Paper → live graduation bar
+The bot stays in paper mode until ALL of these hold simultaneously:
+1. ≥200 paper trades recorded in the trade DB
+2. Net expectancy > 0 after modeled (1–2c) slippage
+3. Max drawdown inside the daily-stop envelope
+4. `book_fill_rate` reported via `scripts/btc5m_tradedb.py exits`
+Only then does $1-stake live validation begin (first proving the real
+order path posts and cancels cleanly — paper never touches the live API).
 
 ## Strategy (Momentum into Close)
 This skill is aligned with a short-horizon momentum strategy:

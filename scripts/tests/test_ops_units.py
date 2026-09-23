@@ -47,6 +47,36 @@ class TradeDbTest(unittest.TestCase):
         self.assertEqual(tradedb.recent(self.con, 5), [])
         self.assertEqual(tradedb.daily_summary(self.con, 7), [])
 
+    def test_exit_mix(self):
+        # book fill, tagged redemption, legacy linger shape (pnl set but
+        # no proceeds), stop-loss, and one unscored row.
+        b = tradedb.record_open(self.con, mode="dry", side="up")
+        tradedb.record_close(self.con, b, close_reason="time_exit_40s",
+                             close_usdc=8.5, pnl_usdc=0.5)
+        d = tradedb.record_open(self.con, mode="dry", side="dn")
+        tradedb.record_close(self.con, d, close_reason="time_exit_40s",
+                             close_usdc=None, pnl_usdc=None)
+        tradedb.settle_resolution(self.con, d, close_usdc=8.0, pnl_usdc=0.0,
+                                  reason_suffix="+resolution_settle_dn")
+        lg = tradedb.record_open(self.con, mode="dry", side="up")
+        tradedb.record_close(self.con, lg, close_reason="time_exit_40s",
+                             close_usdc=None, pnl_usdc=0.16)
+        st = tradedb.record_open(self.con, mode="dry", side="dn")
+        tradedb.record_close(self.con, st, close_reason="stop_loss_25pct",
+                             close_usdc=5.0, pnl_usdc=-3.0)
+        u = tradedb.record_open(self.con, mode="dry", side="up")
+        tradedb.record_close(self.con, u, close_reason="time_exit_40s",
+                             close_usdc=None, pnl_usdc=None)
+        m = tradedb.exit_mix(self.con)
+        self.assertEqual((m['n'], m['book'], m['redemption'],
+                          m['unscored'], m['stops']), (5, 2, 2, 1, 1))
+        self.assertAlmostEqual(m['book_fill_rate'], 0.5)
+
+    def test_exit_mix_empty(self):
+        m = tradedb.exit_mix(self.con)
+        self.assertEqual(m['n'], 0)
+        self.assertIsNone(m['book_fill_rate'])
+
 
 class AlertsTest(unittest.TestCase):
     def setUp(self):
@@ -220,6 +250,66 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual((top["best_bid"], top["best_ask"], top["spread"]),
                          (0.60, 0.72, 0.12))
         self.assertAlmostEqual(top["ask_notional"], 0.72 * 7)
+
+    def test_stop_redeem_settles_at_resolution(self):
+        # #39: de-facto live arm — no book exit, redeem winner at 1.00.
+        snaps = self._both_sides(range(100, 1000, 10))
+        res = backtest.replay(
+            snaps, self._params(hold_mode="stop_redeem", resolution="up"))
+        self.assertEqual(res["metrics"]["n_trades"], 1)
+        t = res["trades"][0]
+        self.assertEqual((t["side"], t["exit_reason"]), ("up", "resolution"))
+        self.assertAlmostEqual(t["exit_price"], 1.0)
+        self.assertAlmostEqual(t["pnl_usdc"], round(5 / 0.72 - 5, 4))
+
+    def test_hold_loses_when_side_loses(self):
+        snaps = self._both_sides(range(100, 1000, 10))
+        res = backtest.replay(
+            snaps, self._params(hold_mode="hold", resolution="dn"))
+        t = res["trades"][0]
+        self.assertEqual(t["exit_reason"], "resolution")
+        self.assertAlmostEqual(t["pnl_usdc"], -5.0)
+
+    def test_hold_ignores_stop_loss(self):
+        snaps = self._both_sides(range(100, 300, 10))
+        snaps += [self._snap(300, "up", 0.40, 0.45),
+                  self._snap(300, "dn", 0.55, 0.60)]
+        snaps += self._both_sides(range(310, 1000, 10))
+        res = backtest.replay(
+            snaps, self._params(hold_mode="hold", resolution="up"))
+        self.assertEqual(res["trades"][0]["exit_reason"], "resolution")
+
+    def test_stop_redeem_keeps_stop_loss(self):
+        # #39: stop_redeem still scratches on the book when it can.
+        snaps = self._both_sides(range(100, 300, 10))
+        snaps += [self._snap(300, "up", 0.40, 0.45),
+                  self._snap(300, "dn", 0.55, 0.60)]
+        snaps += self._both_sides(range(310, 1000, 10))
+        res = backtest.replay(
+            snaps, self._params(hold_mode="stop_redeem", resolution="up"))
+        self.assertEqual(res["trades"][0]["exit_reason"], "stop_loss")
+
+    def test_hold_without_resolution_stays_end_of_data(self):
+        snaps = self._both_sides(range(100, 1000, 10))
+        res = backtest.replay(
+            snaps, self._params(hold_mode="hold", resolution=None))
+        self.assertEqual(res["metrics"]["n_trades"], 0)
+        self.assertEqual(res["trades"][0]["exit_reason"], "end_of_data")
+
+    def test_resolve_event_winner(self):
+        up = {"markets": [{"outcomes": ["Up", "Down"],
+                           "outcomePrices": ["1", "0"]}]}
+        self.assertEqual(backtest.resolve_event_winner(up), "up")
+        dn = {"markets": [{"outcomes": ["Up", "Down"],
+                           "outcomePrices": ["0", "1"]}]}
+        self.assertEqual(backtest.resolve_event_winner(dn), "dn")
+        mid = {"markets": [{"outcomes": ["Up", "Down"],
+                            "outcomePrices": ["0.6", "0.4"]}]}
+        self.assertIsNone(backtest.resolve_event_winner(mid))
+        as_str = {"markets": [{"outcomes": '["Up", "Down"]',
+                               "outcomePrices": '["0", "1"]'}]}
+        self.assertEqual(backtest.resolve_event_winner(as_str), "dn")
+        self.assertIsNone(backtest.resolve_event_winner({"markets": []}))
 
 
 if __name__ == "__main__":
