@@ -15,7 +15,7 @@ now fixed and covered by 129 unit tests (`scripts/tests/`):
 - Crash recovery (`open_position.json` + `--resume`) and a duplicate-position guard
 - Pendulum-based backtest harness (`scripts/btc5m_backtest.py`), validated on a real market
 - Pinned `requirements.txt`, working Dockerfile/compose, log-hygiene fixes
-- Profiles actually differ (conservative: 0.70 threshold, strict guards, 8%-of-equity stake capped at $8; aggressive: 0.65 threshold, looser guards, 15% capped at $15) with equity-derived sizing (`--risk-per-trade-pct`, `--max-notional-usd`)
+- Profiles actually differ (conservative: 0.60 threshold, strict guards, 8%-of-equity stake capped at $8; aggressive: 0.65 threshold, looser guards, 15% capped at $15) with equity-derived sizing (`--risk-per-trade-pct`, `--max-notional-usd`)
 - Graceful shutdown (SIGTERM/SIGINT runs the close cascade; `ctl.sh stop` waits ~30s before SIGKILL), proportional force-close pricing, and a live fire-once micro-hedge with combined PnL
 - Momentum entry matching the documented strategy: side follows the BTC move since market open (Binance 1m klines, `--btc-move-usd-min` 70/50), threshold is a price floor, skew veto blocks entries against crowd flow (`--skew-veto-threshold` 0.10/0.15); `--disable-momentum` restores the legacy trigger
 - Bookless exits settle at resolution: time exit moved to 40s before end (makers pull 5m quotes in the final seconds), and when the book is gone the paper shim credits the resolved $/share instead of $0; every close-debug row carries the failure reason

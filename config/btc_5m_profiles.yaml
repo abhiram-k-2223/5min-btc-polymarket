@@ -46,7 +46,9 @@ profiles:
     signal:
       trigger_source: "clob_best_ask"
       direction_rule: "btc_momentum_since_market_open"
-      threshold_price: 0.70
+      # Floor lowered 0.70 -> 0.60 after the 672-market threshold sweep
+      # (0.60/0.25: +$237, 78% WR, $5.5 DD vs +$173 at 0.70).
+      threshold_price: 0.60
       btc_move_usd_min: 70
       skew_veto_threshold: 0.10
     sizing:

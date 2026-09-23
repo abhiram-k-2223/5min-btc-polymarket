@@ -943,7 +943,10 @@ PROFILES: dict[str, dict[str, Any]] = {
     # Conservative: strict filters, lower per-trade risk (#10, #11).
     # Stake is equity-derived (8% of equity, capped at $8), NOT fixed.
     'conservative': {
-        'threshold': 0.70,
+        # Threshold floor 0.60 (was 0.70): 12-cell sweep over 672 markets
+        # showed cheaper floors monotonically fatter margins
+        # (0.60/0.25 stop: +$237, 78% WR, $5.5 DD vs +$173 at 0.70).
+        'threshold': 0.60,
         'stop_loss_pct': 0.25,
         # Exit ahead of the end-of-window quote pull: makers withdraw
         # 5m books in the final seconds, and a bookless exit past expiry

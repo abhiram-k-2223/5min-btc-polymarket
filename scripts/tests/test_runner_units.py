@@ -120,7 +120,7 @@ class ProfileTest(unittest.TestCase):
 
     def test_conservative_defaults(self):
         a = r.apply_profile(self._ns())
-        self.assertEqual((a.threshold, a.stop_loss_pct), (0.70, 0.25))
+        self.assertEqual((a.threshold, a.stop_loss_pct), (0.60, 0.25))
         self.assertEqual((a.max_spread, a.min_top_ask_notional_usd, a.max_quote_age_sec), (0.03, 30.0, 8.0))
         self.assertEqual((a.max_consecutive_errors, a.max_trades_per_day), (3, 12))
         self.assertEqual(a.max_no_btc_data_sec, 600.0)
