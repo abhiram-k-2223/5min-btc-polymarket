@@ -138,5 +138,37 @@ class NoDataBudgetTest(unittest.TestCase):
         self.assertFalse(g.nodata_budget_exceeded(3, 5.0, None))
 
 
+class BandGuardsTest(unittest.TestCase):
+    def test_rolling_wr_allows_on_small_sample(self):
+        ok, wr = g.band_rolling_wr_ok([1.0, -1.0], window=50, min_wr=0.55)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(wr, 0.5)
+
+    def test_rolling_wr_blocks_below_55(self):
+        pnls = [1.0]*25 + [-1.0]*25  # 50% over full window
+        ok, wr = g.band_rolling_wr_ok(pnls, window=50, min_wr=0.55)
+        self.assertFalse(ok)
+        self.assertAlmostEqual(wr, 0.5)
+
+    def test_rolling_wr_allows_above_55(self):
+        pnls = [1.0]*30 + [-1.0]*20
+        ok, wr = g.band_rolling_wr_ok(pnls, window=50, min_wr=0.55)
+        self.assertTrue(ok)
+
+    def test_rolling_wr_empty_fails_open(self):
+        ok, wr = g.band_rolling_wr_ok([], window=50, min_wr=0.55)
+        self.assertTrue(ok)
+        self.assertIsNone(wr)
+
+    def test_kill_on_3_consec_losses(self):
+        kill, reason = g.band_kill_triggered(consec_band_losses=3, day_pnl=0.0, equity_usd=100.0, daily_max_loss_pct=10.0)
+        self.assertTrue(kill)
+        self.assertEqual(reason, "kill_switch")
+
+    def test_no_kill_below_threshold(self):
+        kill, _ = g.band_kill_triggered(consec_band_losses=2, day_pnl=0.0, equity_usd=100.0, daily_max_loss_pct=10.0)
+        self.assertFalse(kill)
+
+
 if __name__ == "__main__":
     unittest.main()

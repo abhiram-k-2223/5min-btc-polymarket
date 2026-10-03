@@ -325,3 +325,61 @@ def skew_veto(side: str, up_ask, dn_ask, veto_threshold: float) -> bool:
     except (TypeError, ValueError):
         return False
     return skew < -abs(veto)
+
+
+# ---------------------------------------------------------------------------
+# Favorite-band guards (spec 3d; semantics borrowed from polypaper-bot)
+# ---------------------------------------------------------------------------
+
+def band_rolling_wr_ok(pnls, *, window: int = 50, min_wr: float = 0.55):
+    """(allowed, wr) over the trailing ``window`` PnLs. Fail-open on short history."""
+    try:
+        w = max(1, int(window))
+    except (TypeError, ValueError):
+        w = 50
+    try:
+        floor = float(min_wr)
+    except (TypeError, ValueError):
+        floor = 0.55
+    if not isinstance(pnls, (list, tuple)) or len(pnls) < w:
+        wr = None
+        if isinstance(pnls, (list, tuple)) and pnls:
+            wins = sum(1 for p in pnls if (float(p) if isinstance(p, (int, float)) else 0) > 0)
+            try:
+                wr = wins / len(pnls)
+            except Exception:
+                wr = None
+        return True, wr
+    tail = pnls[-w:]
+    wins = 0
+    for p in tail:
+        try:
+            if float(p) > 0:
+                wins += 1
+        except (TypeError, ValueError):
+            continue
+    wr = wins / float(w)
+    return (wr >= floor, wr)
+
+
+def band_kill_triggered(*, consec_band_losses: int = 0, max_consec_losses: int = 3,
+                        day_pnl: float = 0.0, equity_usd: float = 100.0,
+                        daily_max_loss_pct: float = 10.0):
+    """(killed, reason). Kill on -3 band clips or daily-loss breach; reason is machine-readable."""
+    try:
+        streak = int(consec_band_losses or 0)
+    except (TypeError, ValueError):
+        streak = 0
+    try:
+        maxl = int(max_consec_losses)
+    except (TypeError, ValueError):
+        maxl = 3
+    if streak >= maxl:
+        return True, "kill_switch"
+    try:
+        cap = float(equity_usd) * float(daily_max_loss_pct) / 100.0
+        if float(day_pnl) <= -cap:
+            return True, "kill_switch"
+    except (TypeError, ValueError):
+        pass
+    return False, "ok"

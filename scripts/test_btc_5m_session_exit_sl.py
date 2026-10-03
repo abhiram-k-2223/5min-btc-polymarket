@@ -16,6 +16,8 @@ from py_clob_client.constants import POLYGON
 from py_clob_client.clob_types import ApiCreds
 
 from btc5m_guards import (
+    band_kill_triggered,
+    band_rolling_wr_ok,
     can_open,
     clear_open_position,
     error_budget_exceeded,
@@ -1435,6 +1437,7 @@ def main():
     opened = None
     err_streak = 0
     nodata_streak = 0
+    consec_band_losses = 0
     # Session risk ledger (#4, #5): live trades only; dry-runs neither
     # consume the daily budget nor enforce it.
     ledger_file = ledger_path(args.runtime_dir) if args.execute else None
@@ -1721,6 +1724,65 @@ def main():
                 equity_usd=args.equity_usd,
                 stake_usd=args.band_stake_usd)
                 if _mode == 'band' else stake_usd)
+
+            # Band guards (spec 3d): rolling-WR pause + kill switch.
+            # Stale-data gate is reused unchanged below (#8).
+            if _mode == 'band':
+                try:
+                    _bcon = tradedb.connect(args.runtime_dir)
+                    _brows = _bcon.execute(
+                        "SELECT pnl_usdc FROM trades"
+                        " WHERE closed_at IS NOT NULL"
+                        " AND pnl_usdc IS NOT NULL"
+                        " ORDER BY id DESC LIMIT 50").fetchall()
+                    _bcon.close()
+                    _bpnls = [r[0] for r in _brows]
+                except Exception:
+                    _bpnls = []
+                _wr_ok, _wr = band_rolling_wr_ok(
+                    _bpnls, window=50, min_wr=0.55)
+                if not _wr_ok:
+                    log_attempt(report, {
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'skip_rolling_wr_pause',
+                        'mode': _mode,
+                        'rolling_wr': _wr,
+                        'decision': band_decision_json(
+                            mode=_mode, side=side or '?',
+                            gap_usd=btc_move, fav_ask=_fav_ask,
+                            prefer=_prefer,
+                            reason='rolling_wr_pause'),
+                    })
+                    err_streak = 0
+                    time.sleep(args.poll_sec)
+                    continue
+                try:
+                    _dcon = tradedb.connect(args.runtime_dir)
+                    _drow = _dcon.execute(
+                        "SELECT COALESCE(SUM(pnl_usdc), 0) FROM trades"
+                        " WHERE opened_at >= date('now')"
+                        " AND pnl_usdc IS NOT NULL").fetchone()
+                    _dcon.close()
+                    _day_pnl = float((_drow or [0])[0] or 0.0)
+                except Exception:
+                    _day_pnl = 0.0
+                _kill, _kill_reason = band_kill_triggered(
+                    consec_band_losses=consec_band_losses,
+                    day_pnl=_day_pnl, equity_usd=args.equity_usd,
+                    daily_max_loss_pct=args.daily_max_loss_pct)
+                if _kill:
+                    log_attempt(report, {
+                        'ts': ts_utc(),
+                        'slug': slug,
+                        'status': 'kill_switch',
+                        'mode': _mode,
+                        'reason': _kill_reason,
+                        'consec_band_losses': consec_band_losses,
+                        'day_pnl': _day_pnl,
+                    })
+                    abort_run('blocked_kill_switch', 'kill_switch')
+                    return
 
             # Pre-entry execution guards (#6, #7, #8) on the picked side.
             snap_side = 'up' if side == 'UP' else 'dn'
@@ -2180,6 +2242,14 @@ def main():
                     report['settle_warn'] = str(e)
                 break
             time.sleep(min(20.0, max(1.0, _wait_until - time.time())))
+    # Band loss streak (spec 3d): consecutive losing band clips feed
+    # the kill switch at the next entry. Placed after linger-settle so
+    # the streak sees the final pnl. Base legs leave it alone.
+    if opened.get('mode') == 'band':
+        try:
+            consec_band_losses = 0 if (pnl is not None and pnl > 0) else consec_band_losses + 1
+        except (TypeError, ValueError):
+            pass
     if ledger_file is not None:
         _ledger = load_ledger(ledger_file, utc_today())
         record_close(_ledger, pnl)
