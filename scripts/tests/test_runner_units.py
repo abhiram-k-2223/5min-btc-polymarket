@@ -826,5 +826,43 @@ class SettleBackfillTest(unittest.TestCase):
                          300)
 
 
+class RuntimeDirTest(unittest.TestCase):
+    def test_resolve_runtime_dir_defaults_absolute(self):
+        import test_btc_5m_session_exit_sl as r
+        d = r.resolve_runtime_dir(None)
+        self.assertTrue(os.path.isabs(d))
+        self.assertTrue(d.endswith("runtime"))
+
+    def test_resolve_runtime_dir_normalizes_relative(self):
+        import test_btc_5m_session_exit_sl as r
+        d = r.resolve_runtime_dir("runtime")
+        self.assertTrue(os.path.isabs(d))
+        self.assertTrue(d.endswith("runtime"))
+
+    def test_runtime_dir_defaults_to_repo_runtime_and_is_absolute(self):
+        import test_btc_5m_session_exit_sl as r
+        d = r.default_runtime_dir()
+        self.assertTrue(os.path.isabs(d))
+        self.assertTrue(d.endswith("runtime"))
+        # repo root = parents[1] of scripts/test_...py
+        expect = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(r.__file__))), "runtime")
+        self.assertEqual(os.path.normpath(d), os.path.normpath(os.environ.get("BTC5M_RUNTIME_DIR", expect)))
+
+    def test_tradedb_write_roundtrips_in_runtime_dir(self):
+        import btc5m_tradedb as tdb
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            con = tdb.connect(d)
+            tid = tdb.record_open(con, mode="dry", market_slug="slug-test",
+                                  side="UP", token_id="tok", entry_price=0.55,
+                                  shares=10.0, cost_usdc=5.5, btc_entry=90000.0,
+                                  open_order_id="oid-1")
+            con.close()
+            con2 = tdb.connect(d)
+            rows = tdb.recent(con2, 5)
+            con2.close()
+            self.assertTrue(any(x["id"] == tid for x in rows))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1261,8 +1261,20 @@ def repo_path_error(path) -> Optional[str]:
 def default_runtime_dir() -> str:
     env_dir = os.environ.get('BTC5M_RUNTIME_DIR')
     if env_dir:
-        return env_dir
+        return os.path.abspath(os.path.expanduser(env_dir))
     return str(Path(__file__).resolve().parents[1] / 'runtime')
+
+
+def resolve_runtime_dir(cli_value=None) -> str:
+    """Absolute runtime dir: explicit flag wins, else env/default.
+
+    Normalizes relative inputs so the trade DB, risk ledger, and crash
+    state always land in one observable place (the 0-row bug was an
+    operator inspecting a different relative dir than the runner wrote).
+    """
+    if cli_value:
+        return os.path.abspath(os.path.expanduser(str(cli_value)))
+    return default_runtime_dir()
 
 
 def main():
@@ -1302,14 +1314,15 @@ def main():
     ap.add_argument('--max-trades-per-day', type=int, default=None, help='Block new entries after this many live trades today (UTC)')
     ap.add_argument('--daily-max-loss-pct', type=float, default=None, help='Block new entries after losing this pct of equity today (UTC)')
     ap.add_argument('--equity-usd', type=float, default=None, help='Account equity reference for the daily-loss cap')
-    ap.add_argument('--runtime-dir', default=None, help='Runtime dir holding logs and the risk ledger (default: <skill>/runtime)')
+    ap.add_argument('--runtime-dir', default=None, help='Runtime dir holding logs, ledger and btc5m_trades.sqlite (default: <repo>/runtime; env BTC5M_RUNTIME_DIR overrides)')
     ap.add_argument('--resume', action='store_true', help='Resume a leftover open position from a crashed run instead of opening a new one (#33)')
     ap.add_argument('--wallet-address', default=os.environ.get('BTC5M_WALLET_ADDRESS') or os.environ.get('POLY_WALLET_ADDRESS'), help='Wallet for the pre-entry duplicate-position check (#33)')
     ap.add_argument('--alert-webhook-url', default=None, help='Optional webhook URL for entry/close/abort alerts; falls back to BTC5M_ALERT_WEBHOOK env (#27)')
     ap.add_argument('--execute', action='store_true')
     args = apply_profile(ap.parse_args())
-    if args.runtime_dir is None:
-        args.runtime_dir = default_runtime_dir()
+    args.runtime_dir = resolve_runtime_dir(args.runtime_dir)
+    os.makedirs(args.runtime_dir, exist_ok=True)
+    print(f"[runtime] runtime_dir={args.runtime_dir}", flush=True)
     # Fail fast on a bad execution checkout (#18) instead of dying
     # mid-run when the first subprocess call needs it.
     _repo_err = repo_path_error(args.repo)
