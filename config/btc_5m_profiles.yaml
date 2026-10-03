@@ -68,6 +68,7 @@ profiles:
     stop_loss:
       enabled: true
       stop_loss_pct_from_entry: 0.25
+    band: {enabled: true, max_ask: 0.70, prefer_low: 0.52, prefer_high: 0.57, stake_usd: 10, stop: false}
 
   aggressive:
     description: "Higher frequency and higher risk mode."
@@ -94,6 +95,7 @@ profiles:
     stop_loss:
       enabled: true
       stop_loss_pct_from_entry: 0.30
+    band: {enabled: true, max_ask: 0.70, prefer_low: 0.52, prefer_high: 0.57, stake_usd: 12, stop: false}
 
 runner_mapping:
   script: "skills/btc-5m-live/scripts/test_btc_5m_session_exit_sl.py"
@@ -117,6 +119,10 @@ runner_mapping:
     - "--force-close-discount-pct"
     - "--force-close-max-discount-abs"
     - "--btc-move-usd-min"
+    - "--entry-mode"
+    - "--band-min-gap-usd"
+    - "--band-max-ask"
+    - "--band-stake-usd"
     - "--skew-veto-threshold"
     - "--disable-momentum"
     - "--candidate-slots"
