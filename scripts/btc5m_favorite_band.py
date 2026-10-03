@@ -72,6 +72,27 @@ def decision_json(*, mode: str, side: str, gap_usd=None, fav_ask=None,
             "fav_ask": fav_ask, "prefer_zone": bool(prefer), "reason": reason}
 
 
+def band_lane(*, entry_mode=None, side_gap_usd=None, fav_ask=None,
+              min_gap_usd: float = 70.0, band_max_ask: float = 0.70) -> bool:
+    """True when the band leg may be attempted: mode allows it and the
+    favorite ask sits in-band with momentum agreement. The runner uses
+    this to exempt band candidates from the base price-floor gate."""
+    if entry_mode is None or str(entry_mode).lower() not in ("band", "both"):
+        return False
+    try:
+        cap = float(band_max_ask)
+    except (TypeError, ValueError):
+        return False
+    return bool(allow_entry(side_gap_usd=side_gap_usd, fav_ask=fav_ask,
+                            min_gap_usd=min_gap_usd, band_high=cap))
+
+
+def hedge_suppressed(*, mode=None) -> bool:
+    """True when the micro-hedge must not fire: the band leg never
+    hedges the opposite side (spec 3a)."""
+    return (mode or "") == "band"
+
+
 def select_mode(*, entry_mode: str, fav_ask=None, side_ask=None,
                 band_max_ask: float = 0.70, base_threshold: float = 0.60) -> str:
     m = (entry_mode or "both").lower()

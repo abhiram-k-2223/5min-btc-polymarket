@@ -383,3 +383,55 @@ def band_kill_triggered(*, consec_band_losses: int = 0, max_consec_losses: int =
     except (TypeError, ValueError):
         pass
     return False, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Persisted band loss streak (the runner is single-shot: an in-memory
+# counter resets every invocation, so the -3-clip arm must survive
+# across runs via this small state file next to the risk ledger).
+# ---------------------------------------------------------------------------
+
+BAND_STREAK_FILENAME = "band_streak.json"
+
+
+def band_streak_path(runtime_dir: str) -> str:
+    import os as _os
+
+    return _os.path.join(str(runtime_dir), BAND_STREAK_FILENAME)
+
+
+def load_band_streak(path: str) -> int:
+    """Consecutive band losses from the state file; missing, corrupt,
+    or negative content fails safe to 0 (never spuriously kills)."""
+    try:
+        import json as _json
+
+        with open(str(path), "r", encoding="utf-8") as fh:
+            obj = _json.load(fh)
+        n = int(obj.get("consec_band_losses", 0)) if isinstance(obj, dict) else 0
+        return max(0, n)
+    except Exception:
+        return 0
+
+
+def save_band_streak(path: str, n: int) -> bool:
+    """Persist the streak atomically (tmp file + replace)."""
+    try:
+        import json as _json
+
+        count = max(0, int(n))
+    except (TypeError, ValueError):
+        return False
+    try:
+        import os as _os
+
+        parent = _os.path.dirname(str(path))
+        if parent:
+            _os.makedirs(parent, exist_ok=True)
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            _json.dump({"consec_band_losses": count}, fh)
+        _os.replace(tmp, str(path))
+        return True
+    except Exception:
+        return False

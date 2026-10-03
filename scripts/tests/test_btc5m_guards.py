@@ -170,5 +170,28 @@ class BandGuardsTest(unittest.TestCase):
         self.assertFalse(kill)
 
 
+class BandStreakTest(unittest.TestCase):
+    """Persisted band loss streak (review I4): the runner is single-shot,
+    so an in-memory counter can never reach -3 across runs."""
+
+    def test_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "band_streak.json")
+            self.assertTrue(g.save_band_streak(path, 2))
+            self.assertEqual(g.load_band_streak(path), 2)
+
+    def test_missing_file_is_zero(self):
+        self.assertEqual(g.load_band_streak("/nonexistent/band_streak.json"), 0)
+
+    def test_corrupt_and_negative_is_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "band_streak.json")
+            with open(path, "w") as fh:
+                fh.write("{not json")
+            self.assertEqual(g.load_band_streak(path), 0)
+            self.assertTrue(g.save_band_streak(path, -5))
+            self.assertEqual(g.load_band_streak(path), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

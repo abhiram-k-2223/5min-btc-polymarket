@@ -75,5 +75,44 @@ class SelectModeTest(unittest.TestCase):
         self.assertEqual(b.select_mode(entry_mode="both", fav_ask=0.85, side_ask=0.90, band_max_ask=0.70, base_threshold=0.60), "base")
 
 
+class BandLaneTest(unittest.TestCase):
+    """band_lane() gates the threshold exemption (I2) and band candidacy."""
+
+    def test_band_mode_in_band_allows(self):
+        self.assertTrue(b.band_lane(entry_mode="band", side_gap_usd=80.0, fav_ask=0.55, min_gap_usd=70.0))
+
+    def test_both_mode_allows(self):
+        self.assertTrue(b.band_lane(entry_mode="both", side_gap_usd=-80.0, fav_ask=0.55, min_gap_usd=70.0))
+
+    def test_base_mode_never(self):
+        self.assertFalse(b.band_lane(entry_mode="base", side_gap_usd=80.0, fav_ask=0.55, min_gap_usd=70.0))
+
+    def test_gap_failure_closes_lane(self):
+        self.assertFalse(b.band_lane(entry_mode="both", side_gap_usd=10.0, fav_ask=0.55, min_gap_usd=70.0))
+
+    def test_out_of_band_closes_lane(self):
+        self.assertFalse(b.band_lane(entry_mode="both", side_gap_usd=80.0, fav_ask=0.85, min_gap_usd=70.0))
+
+    def test_loosened_max_ask_opens_lane(self):
+        # M1: --band-max-ask above 0.70 must take effect, not silently skip.
+        self.assertTrue(b.band_lane(entry_mode="both", side_gap_usd=80.0, fav_ask=0.73, min_gap_usd=70.0, band_max_ask=0.75))
+        self.assertFalse(b.band_lane(entry_mode="both", side_gap_usd=80.0, fav_ask=0.73, min_gap_usd=70.0, band_max_ask=0.70))
+
+    def test_none_inputs_close_lane(self):
+        self.assertFalse(b.band_lane(entry_mode="both", side_gap_usd=None, fav_ask=0.55, min_gap_usd=70.0))
+        self.assertFalse(b.band_lane(entry_mode=None, side_gap_usd=80.0, fav_ask=0.55, min_gap_usd=70.0))
+
+
+class HedgeSuppressedTest(unittest.TestCase):
+    """Band leg never hedges (spec 3a, review I1)."""
+
+    def test_band_suppresses_hedge(self):
+        self.assertTrue(b.hedge_suppressed(mode="band"))
+
+    def test_base_and_unknown_do_not(self):
+        self.assertFalse(b.hedge_suppressed(mode="base"))
+        self.assertFalse(b.hedge_suppressed(mode=None))
+
+
 if __name__ == "__main__":
     unittest.main()

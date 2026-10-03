@@ -18,7 +18,10 @@ from py_clob_client.clob_types import ApiCreds
 from btc5m_guards import (
     band_kill_triggered,
     band_rolling_wr_ok,
+    band_streak_path,
     can_open,
+    load_band_streak,
+    save_band_streak,
     clear_open_position,
     error_budget_exceeded,
     ledger_path,
@@ -41,8 +44,9 @@ from btc5m_guards import (
 import btc5m_alerts as alerts
 import btc5m_tradedb as tradedb
 from btc5m_favorite_band import (
-    allow_entry as band_allow_entry,
+    band_lane,
     decision_json as band_decision_json,
+    hedge_suppressed,
     prefer_zone as band_prefer_zone,
     select_mode as band_select_mode,
     size_for_band as band_size_for_band,
@@ -1437,7 +1441,9 @@ def main():
     opened = None
     err_streak = 0
     nodata_streak = 0
-    consec_band_losses = 0
+    # Persisted band loss streak (I4): the runner is single-shot, so an
+    # in-memory counter could never reach -3 across runs.
+    consec_band_losses = load_band_streak(band_streak_path(args.runtime_dir))
     # Session risk ledger (#4, #5): live trades only; dry-runs neither
     # consume the daily budget nor enforce it.
     ledger_file = ledger_path(args.runtime_dir) if args.execute else None
@@ -1634,7 +1640,15 @@ def main():
                 side = mom_side
                 snap_side = 'up' if side == 'UP' else 'dn'
                 trigger_price = snap[f'{snap_side}_ask']
-                if trigger_price is None or float(trigger_price) < args.threshold:
+                # Band lane (I2): an in-band favorite with momentum
+                # agreement bypasses the base price floor — the floor
+                # would otherwise amputate 0.50-0.59 band entries.
+                _band_lane = band_lane(
+                    entry_mode=args.entry_mode, side_gap_usd=btc_move,
+                    fav_ask=trigger_price,
+                    min_gap_usd=args.band_min_gap_usd,
+                    band_max_ask=args.band_max_ask)
+                if not _band_lane and (trigger_price is None or float(trigger_price) < args.threshold):
                     log_attempt(report, {
                         'ts': ts_utc(),
                         'slug': slug,
@@ -1689,15 +1703,26 @@ def main():
             # base when the picked-side ask clears the base threshold.
             _fav_ask = snap[('up_ask' if side == 'UP' else 'dn_ask')] if side else None
             _prefer = band_prefer_zone(_fav_ask)
-            _band_ok = (btc_move is not None and bool(band_allow_entry(
-                side_gap_usd=btc_move, fav_ask=_fav_ask,
-                min_gap_usd=args.band_min_gap_usd)))
+            _band_ok = band_lane(
+                entry_mode=args.entry_mode, side_gap_usd=btc_move,
+                fav_ask=_fav_ask, min_gap_usd=args.band_min_gap_usd,
+                band_max_ask=args.band_max_ask)
             _mode = band_select_mode(
                 entry_mode=args.entry_mode, fav_ask=_fav_ask,
                 side_ask=trigger_price, band_max_ask=args.band_max_ask,
                 base_threshold=args.threshold)
             if _mode == 'band' and not _band_ok:
-                _mode = 'skip'
+                # I3: 'both' falls back to base when the band gap
+                # disagrees but the base floor clears; 'band'-only
+                # still skips. Base floor re-checked (float-safe).
+                try:
+                    _base_floor_ok = (
+                        (args.entry_mode or 'both').lower() == 'both'
+                        and trigger_price is not None
+                        and float(trigger_price) >= float(args.threshold))
+                except (TypeError, ValueError):
+                    _base_floor_ok = False
+                _mode = 'base' if _base_floor_ok else 'skip'
             _decision = band_decision_json(
                 mode=_mode, side=side or '?', gap_usd=btc_move,
                 fav_ask=_fav_ask, prefer=_prefer,
@@ -2010,7 +2035,10 @@ def main():
         # run_open path as the main entry, and any failure only logs.
         # Skipped inside the final poll window (#37): starting slow
         # subprocess work there would push the exit past its timestamp.
-        if (exit_ts - now) > args.poll_sec and hedge_triggered(
+        # Band leg never hedges (spec 3a, I1).
+        if ((exit_ts - now) > args.poll_sec
+                and not hedge_suppressed(mode=opened.get('mode'))
+                and hedge_triggered(
             side_px,
             (end_ts - now) if end_ts else None,
             trigger_price=args.hedge_trigger_price,
@@ -2019,7 +2047,7 @@ def main():
             already_placed_or_attempted=bool(
                 opened.get('hedge_placed') or opened.get('hedge_attempted')),
             hedge_token_id=opened.get('hedge_token_id'),
-        ):
+        )):
             opened['hedge_attempted'] = True
             hedge_side = 'DOWN' if opened.get('side') == 'UP' else 'UP'
             hedge_size = hedge_sizing(
@@ -2249,6 +2277,10 @@ def main():
         try:
             consec_band_losses = 0 if (pnl is not None and pnl > 0) else consec_band_losses + 1
         except (TypeError, ValueError):
+            pass
+        try:
+            save_band_streak(band_streak_path(args.runtime_dir), consec_band_losses)
+        except Exception:
             pass
     if ledger_file is not None:
         _ledger = load_ledger(ledger_file, utc_today())
