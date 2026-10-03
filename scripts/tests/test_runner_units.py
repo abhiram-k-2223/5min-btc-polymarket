@@ -864,5 +864,39 @@ class RuntimeDirTest(unittest.TestCase):
             self.assertTrue(any(x["id"] == tid for x in rows))
 
 
+class EntryModeTest(unittest.TestCase):
+    def _ns(self, **kw):
+        base = dict(profile="conservative", threshold=None, stake_usd=None,
+            risk_per_trade_pct=None, max_notional_usd=None, stop_loss_pct=None,
+            exit_before_sec=None, min_entry_seconds_left=None, entry_timeout_min=None,
+            poll_sec=None, max_spread=None, min_top_ask_notional_usd=None,
+            max_quote_age_sec=None, max_consecutive_errors=None, max_no_btc_data_sec=None,
+            max_trades_per_day=None, daily_max_loss_pct=None, equity_usd=None,
+            entry_mode=None, band_min_gap_usd=None, band_max_ask=None, band_stake_usd=None,
+            btc_move_usd_min=None, skew_veto_threshold=None, post_market_wait_sec=None,
+            hedge_trigger_price=None, hedge_trigger_seconds_left=None, hedge_share_pct=None,
+            hedge_min_notional_usd=None, hedge_max_notional_usd=None)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def test_profile_fills_band_defaults(self):
+        import test_btc_5m_session_exit_sl as r
+        args = r.apply_profile(self._ns())
+        self.assertEqual(args.entry_mode, "both")
+        self.assertAlmostEqual(args.band_max_ask, 0.70)
+        self.assertAlmostEqual(args.band_stake_usd, 10.0)
+
+    def test_explicit_flags_win(self):
+        import test_btc_5m_session_exit_sl as r
+        args = r.apply_profile(self._ns(entry_mode="band", band_max_ask=0.65))
+        self.assertEqual(args.entry_mode, "band")
+        self.assertAlmostEqual(args.band_max_ask, 0.65)
+
+    def test_select_mode_both_prefers_band(self):
+        import btc5m_favorite_band as b
+        self.assertEqual(b.select_mode(entry_mode="both", fav_ask=0.55, side_ask=0.90), "band")
+        self.assertEqual(b.select_mode(entry_mode="both", fav_ask=0.90, side_ask=0.90), "base")
+
+
 if __name__ == "__main__":
     unittest.main()

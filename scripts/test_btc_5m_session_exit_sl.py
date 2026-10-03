@@ -38,6 +38,13 @@ from btc5m_guards import (
 
 import btc5m_alerts as alerts
 import btc5m_tradedb as tradedb
+from btc5m_favorite_band import (
+    allow_entry as band_allow_entry,
+    decision_json as band_decision_json,
+    prefer_zone as band_prefer_zone,
+    select_mode as band_select_mode,
+    size_for_band as band_size_for_band,
+)
 
 UTC = dt.timezone.utc
 
@@ -982,6 +989,11 @@ PROFILES: dict[str, dict[str, Any]] = {
         # against strong crowd flow (#1, #2, #3).
         'btc_move_usd_min': 70.0,
         'skew_veto_threshold': 0.10,
+        # Favorite-band leg (spec 3a/3b): entry_mode base|band|both.
+        'entry_mode': 'both',
+        'band_min_gap_usd': 70.0,
+        'band_max_ask': 0.70,
+        'band_stake_usd': 10.0,
         # Post-market resolution wait: UMA finalizes minutes after the
         # window ends, so a failed CLOB exit lingers this long polling
         # Gamma before the session gives up (the next session's startup
@@ -1018,6 +1030,11 @@ PROFILES: dict[str, dict[str, Any]] = {
         # the skew veto tolerates more disagreement (#1, #2, #3).
         'btc_move_usd_min': 50.0,
         'skew_veto_threshold': 0.15,
+        # Favorite-band leg: looser gap gate, $12 stake, still no stop.
+        'entry_mode': 'both',
+        'band_min_gap_usd': 50.0,
+        'band_max_ask': 0.70,
+        'band_stake_usd': 12.0,
         # Same post-market resolution wait as conservative (#37).
         'post_market_wait_sec': 300,
     },
@@ -1056,6 +1073,10 @@ def apply_profile(args: argparse.Namespace) -> argparse.Namespace:
         ('hedge_max_notional_usd', float),
         ('btc_move_usd_min', float),
         ('skew_veto_threshold', float),
+        ('entry_mode', str),
+        ('band_min_gap_usd', float),
+        ('band_max_ask', float),
+        ('band_stake_usd', float),
         ('post_market_wait_sec', int),
     ):
         _apply_profile_value(args, name, cast)
@@ -1298,6 +1319,10 @@ def main():
     ap.add_argument('--hedge-trigger-price', type=float, default=None, help='Place the micro-hedge once the held side bid reaches this (default: 0.95 conservative, 0.93 aggressive)')
     ap.add_argument('--btc-move-usd-min', type=float, default=None, help='Min |BTC move| since market open to allow entry; side follows the move (default: 70 conservative, 50 aggressive; #1, #3)')
     ap.add_argument('--skew-veto-threshold', type=float, default=None, help='Veto entry when skew opposes momentum beyond this (default: 0.10 conservative, 0.15 aggressive; #2)')
+    ap.add_argument('--entry-mode', choices=['base', 'band', 'both'], default=None, help='Entry leg: base (0.60+ with stop), band (0.50-0.70 no stop), or both (band first, base fallback)')
+    ap.add_argument('--band-min-gap-usd', type=float, default=None, help='Min |BTC move| since slot open for band entries (default: 70 conservative, 50 aggressive)')
+    ap.add_argument('--band-max-ask', type=float, default=None, help='Max favorite ask for band entries (default: 0.70)')
+    ap.add_argument('--band-stake-usd', type=float, default=None, help='Fixed stake for band entries (default: 10 conservative, 12 aggressive)')
     ap.add_argument('--disable-momentum', action='store_true', help='Restore the legacy highest-ask entry trigger (comparison runs only; #3)')
     ap.add_argument('--post-market-wait-sec', type=int, default=None, help='After a failed CLOB exit, poll Gamma for resolution up to this long before giving up (default: 300; #37)')
     ap.add_argument('--disable-settle-backfill', action='store_true', help='Skip the startup backfill that scores closed-but-unpriced trades from Gamma resolution (#37)')
@@ -1392,6 +1417,10 @@ def main():
             'force_close_max_discount_abs': args.force_close_max_discount_abs,
             'btc_move_usd_min': args.btc_move_usd_min,
             'skew_veto_threshold': args.skew_veto_threshold,
+            'entry_mode': args.entry_mode,
+            'band_min_gap_usd': args.band_min_gap_usd,
+            'band_max_ask': args.band_max_ask,
+            'band_stake_usd': args.band_stake_usd,
             'disable_momentum': args.disable_momentum,
             'candidate_slots': args.candidate_slots,
             'post_market_wait_sec': args.post_market_wait_sec,
@@ -1652,6 +1681,47 @@ def main():
 
                 side, trigger_price = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
 
+            # Favorite-band leg select (spec 3b): band first when the
+            # favorite ask sits in-band with momentum agreement, else
+            # base when the picked-side ask clears the base threshold.
+            _fav_ask = snap[('up_ask' if side == 'UP' else 'dn_ask')] if side else None
+            _prefer = band_prefer_zone(_fav_ask)
+            _band_ok = (btc_move is not None and bool(band_allow_entry(
+                side_gap_usd=btc_move, fav_ask=_fav_ask,
+                min_gap_usd=args.band_min_gap_usd)))
+            _mode = band_select_mode(
+                entry_mode=args.entry_mode, fav_ask=_fav_ask,
+                side_ask=trigger_price, band_max_ask=args.band_max_ask,
+                base_threshold=args.threshold)
+            if _mode == 'band' and not _band_ok:
+                _mode = 'skip'
+            _decision = band_decision_json(
+                mode=_mode, side=side or '?', gap_usd=btc_move,
+                fav_ask=_fav_ask, prefer=_prefer,
+                reason='ok' if _mode != 'skip' else 'entry_mode_mismatch')
+            if _mode == 'skip':
+                log_attempt(report, {
+                    'ts': ts_utc(),
+                    'slug': slug,
+                    'status': 'skip_entry_mode_mismatch',
+                    'side': side,
+                    'gap_usd': btc_move,
+                    'fav_ask': _fav_ask,
+                    'prefer_zone': _prefer,
+                    'mode': _mode,
+                    'decision': _decision,
+                    'seconds_left': sec_left,
+                })
+                err_streak = 0
+                time.sleep(args.poll_sec)
+                continue
+            # Band leg: fixed $10 paper sizing, no stop-loss. Base leg:
+            # equity-derived stake with stop (unchanged behavior).
+            entry_stake_usd = (band_size_for_band(
+                equity_usd=args.equity_usd,
+                stake_usd=args.band_stake_usd)
+                if _mode == 'band' else stake_usd)
+
             # Pre-entry execution guards (#6, #7, #8) on the picked side.
             snap_side = 'up' if side == 'UP' else 'dn'
             side_spread = snap[f'{snap_side}_spread']
@@ -1715,7 +1785,7 @@ def main():
                     time.sleep(args.poll_sec)
                     continue
 
-            out, objs = run_open(args.repo, slug, side, stake_usd, args.execute,
+            out, objs = run_open(args.repo, slug, side, entry_stake_usd, args.execute,
                                  args.max_spread, args.min_top_ask_notional_usd,
                                  args.equity_usd, args.max_notional_usd)
             post = None
@@ -1750,7 +1820,25 @@ def main():
                     # authorized this entry (None in legacy trigger mode).
                     'btc_move_usd_at_entry': btc_move,
                     'btc_direction_at_entry': btc_dir,
+                    # Favorite-band context (spec 3b): leg, gap, book
+                    # lean, and the machine-readable entry decision.
+                    'mode': _mode,
+                    'gap_usd': btc_move,
+                    'fav_ask': _fav_ask,
+                    'prefer_zone': _prefer,
+                    'decision': _decision,
                 }
+                log_attempt(report, {
+                    'ts': ts_utc(),
+                    'slug': slug,
+                    'status': 'entered',
+                    'side': side,
+                    'mode': _mode,
+                    'gap_usd': btc_move,
+                    'fav_ask': _fav_ask,
+                    'prefer_zone': _prefer,
+                    'decision': _decision,
+                })
                 report['open_raw'] = out[-4000:]
                 # Machine-readable outcome for watchers (#29): the watcher
                 # stops its loop on '"decision": "enter"'.
@@ -1825,7 +1913,10 @@ def main():
         end_ts = time.time() + 300
 
     sl_price = opened['entry_price'] * (1.0 - args.stop_loss_pct)
-    report['stop_loss_price'] = sl_price
+    # Band leg holds to the 40s time exit with no stop-loss (spec 3a):
+    # a mid-band stop turns the edge into noise loss. Base keeps it.
+    use_stop = (opened.get('mode') != 'band')
+    report['stop_loss_price'] = sl_price if use_stop else None
 
     close_reason = None
     # Clock-based exit (#37): the exit timestamp is fixed at entry so the
@@ -1848,7 +1939,7 @@ def main():
         report['last_side_price'] = side_px
         report['last_side_price_source'] = 'clob_best_bid'
         report['last_check_at'] = ts_utc()
-        if side_px is not None and side_px <= sl_price:
+        if use_stop and side_px is not None and side_px <= sl_price:
             close_reason = f"stop_loss_{int(args.stop_loss_pct * 100)}pct"
             break
         # Micro-hedge placement (#13): once the held side looks almost
